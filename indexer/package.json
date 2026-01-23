@@ -1,0 +1,23 @@
+{
+  "name": "yieldo-indexer",
+  "version": "1.0.0",
+  "description": "Event indexer for Yieldo MVP",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@lagoon-protocol/v0-viem": "^0.1.0",
+    "express": "^4.18.2",
+    "mongodb": "^6.3.0",
+    "viem": "^2.0.0",
+    "dotenv": "^16.3.1",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}
+
