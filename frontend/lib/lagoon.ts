@@ -55,13 +55,15 @@ export async function getVaultAPR(
 export async function getVaultState(vaultAddress: Address) {
   const vault = await fetchVault(vaultAddress)
   
-  // Calculate share price (assets per share)
-  const sharePrice = vault.totalSupply > 0n 
+  if (!vault) {
+    throw new Error('Failed to fetch vault')
+  }
+  
+  const sharePrice = vault.totalSupply > BigInt(0) 
     ? vault.convertToAssets(VaultUtils.ONE_SHARE)
     : VaultUtils.ONE_SHARE
   
-  // Calculate assets per share in human readable format
-  const sharePriceFormatted = Number(sharePrice) / Number(10n ** BigInt(vault.underlyingDecimals))
+  const sharePriceFormatted = Number(sharePrice) / Number(BigInt(10) ** BigInt(vault.underlyingDecimals))
   
   return {
     // Basic info

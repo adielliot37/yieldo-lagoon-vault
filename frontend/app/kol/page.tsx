@@ -475,9 +475,9 @@ export default function KOLPage() {
                 />
               </div>
 
-              {allowance !== undefined && amount && (
+              {allowance !== undefined && allowance !== null && amount && (
                 <div className={`text-sm p-3 border rounded ${
-                  allowance >= parseUnits(amount, 6) 
+                  (allowance as bigint) >= parseUnits(amount, 6) 
                     ? 'bg-green-50 border-green-300 text-green-800' 
                     : 'bg-gray-50 border-gray-300 text-gray-600'
                 }`}>
@@ -487,16 +487,16 @@ export default function KOLPage() {
                       <span className="ml-2 text-xs">(Confirming...)</span>
                     )}
                   </p>
-                  {allowance < parseUnits(amount, 6) && !isApprovalConfirming && (
+                  {(allowance as bigint) < parseUnits(amount, 6) && !isApprovalConfirming && (
                     <p className="text-red-600 mt-1 text-xs">Insufficient allowance. Please approve first.</p>
                   )}
-                  {isApprovalSuccess && allowance < parseUnits(amount, 6) && (
+                  {isApprovalSuccess && (allowance as bigint) < parseUnits(amount, 6) && (
                     <p className="text-blue-600 mt-1 text-xs">Approval confirmed! Refreshing allowance...</p>
                   )}
                 </div>
               )}
 
-              {allowance !== undefined && allowance < parseUnits(amount || '0', 6) && (
+              {allowance !== undefined && allowance !== null && (allowance as bigint) < parseUnits(amount || '0', 6) && (
                 <button
                   onClick={handleApprove}
                   disabled={loading || isPending || isApprovalConfirming || isApproving || !amount}
@@ -515,7 +515,7 @@ export default function KOLPage() {
 
               <button
                 onClick={handleDeposit}
-                disabled={loading || isPending || !amount || (allowance !== undefined && allowance < parseUnits(amount, 6))}
+                disabled={loading || isPending || !amount || (allowance !== undefined && allowance !== null && (allowance as bigint) < parseUnits(amount, 6))}
                 className="w-full bg-black text-white py-3 px-6 font-bold hover:bg-gray-800 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
               >
                 {loading || isPending ? 'Depositing...' : 'Deposit to Vault'}
@@ -588,7 +588,7 @@ export default function KOLPage() {
                           hash = intent.intentHash.startsWith('0x') ? intent.intentHash : `0x${intent.intentHash}`
                         } else if (intent.intentHash && typeof intent.intentHash === 'object') {
                           hash = intent.intentHash.toString()
-                          if (!hash.startsWith('0x')) hash = `0x${hash}`
+                          if (hash && !hash.startsWith('0x')) hash = `0x${hash}`
                         }
                         
                         if (hash && hash.length === 66) {
