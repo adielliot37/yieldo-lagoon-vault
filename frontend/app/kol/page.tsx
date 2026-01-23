@@ -60,7 +60,8 @@ export default function KOLPage() {
     
     try {
       setLoadingIntents(true)
-      const response = await fetch(`${process.env.NEXT_PUBLIC_INDEXER_API_URL || 'http://localhost:3001'}/api/intents?user=${address}`)
+      const apiUrl = (process.env.NEXT_PUBLIC_INDEXER_API_URL || 'http://localhost:3001').replace(/\/$/, '')
+      const response = await fetch(`${apiUrl}/api/intents?user=${address}`)
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`)
       }

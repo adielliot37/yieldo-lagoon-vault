@@ -46,7 +46,7 @@ export default function Dashboard() {
 
   const fetchUserData = async () => {
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_INDEXER_API_URL || 'http://localhost:3001'
+      const apiUrl = (process.env.NEXT_PUBLIC_INDEXER_API_URL || 'http://localhost:3001').replace(/\/$/, '')
       const [depositsRes, snapshotsRes] = await Promise.all([
         fetch(`${apiUrl}/api/deposits?user=${address}`),
         fetch(`${apiUrl}/api/snapshots`)
