@@ -10,9 +10,13 @@ import { signDepositIntent, getIntentHash, type DepositIntent } from '@/lib/eip7
 import ERC20_ABI from '@/lib/erc20-abi.json'
 import DEPOSIT_ROUTER_ABI from '@/lib/deposit-router-abi.json'
 
-const USDC_ADDRESS = process.env.NEXT_PUBLIC_USDC_ADDRESS || '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E' // Avalanche USDC
-const VAULT_ADDRESS = process.env.NEXT_PUBLIC_LAGOON_VAULT_ADDRESS || '0x3048925b3ea5a8c12eecccb8810f5f7544db54af' // Turtle Avalanche USDC
-const DEPOSIT_ROUTER_ADDRESS = process.env.NEXT_PUBLIC_DEPOSIT_ROUTER_ADDRESS || '0x99833702EE87DC29F294E98D2f7561247F02A5cA'
+const USDC_ADDRESS = process.env.NEXT_PUBLIC_USDC_ADDRESS || '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E'
+const VAULT_ADDRESS = process.env.NEXT_PUBLIC_LAGOON_VAULT_ADDRESS || '0x3048925b3ea5a8c12eecccb8810f5f7544db54af'
+const DEPOSIT_ROUTER_ADDRESS = process.env.NEXT_PUBLIC_DEPOSIT_ROUTER_ADDRESS
+
+if (typeof window !== 'undefined' && !DEPOSIT_ROUTER_ADDRESS) {
+  console.error('⚠️ NEXT_PUBLIC_DEPOSIT_ROUTER_ADDRESS is not set in .env file!')
+} 
 
 export default function KOLPage() {
   const { address, isConnected } = useAccount()
@@ -29,6 +33,8 @@ export default function KOLPage() {
   const [loadingIntents, setLoadingIntents] = useState(false)
   const [executeSuccess, setExecuteSuccess] = useState(false)
   const [executedHash, setExecutedHash] = useState<`0x${string}` | null>(null)
+  const [depositSuccess, setDepositSuccess] = useState(false)
+  const [depositHash, setDepositHash] = useState<`0x${string}` | null>(null)
   const publicClient = usePublicClient()
 
   const { writeContract, data: hash, isPending, reset: resetWriteContract, error: writeError } = useWriteContract()
@@ -36,7 +42,6 @@ export default function KOLPage() {
     hash,
   })
 
-  // Track approval transaction separately
   const { 
     isLoading: isApprovalConfirming, 
     isSuccess: isApprovalSuccess 
@@ -44,14 +49,12 @@ export default function KOLPage() {
     hash: approvalHash,
   })
 
-  // Track hash changes and assign to approval if we're approving
   useEffect(() => {
     if (hash && currentTxType === 'approve' && !approvalHash) {
       setApprovalHash(hash)
     }
   }, [hash, currentTxType, approvalHash])
 
-  // Fetch pending intents from indexer
   const fetchPendingIntents = async () => {
     if (!address) return
     
@@ -62,79 +65,51 @@ export default function KOLPage() {
         throw new Error(`HTTP error! status: ${response.status}`)
       }
       const data = await response.json()
-      // Filter for pending intents
       const pending = data.filter((intent: any) => intent.status === 'pending')
       setPendingIntents(pending)
     } catch (error) {
       console.error('Error fetching pending intents:', error)
-      // Set empty array on error so UI doesn't break
       setPendingIntents([])
     } finally {
       setLoadingIntents(false)
     }
   }
 
-  // Fetch pending intents on mount and when address changes
   useEffect(() => {
     if (address) {
       fetchPendingIntents()
-      // Refresh every 30 seconds (reduced frequency)
       const interval = setInterval(fetchPendingIntents, 30000)
       return () => clearInterval(interval)
     }
   }, [address])
 
-  // Track deposit intent creation success to get intent hash from event
   useEffect(() => {
-    const fetchIntentHash = async () => {
-      if (isSuccess && currentTxType === 'deposit' && hash && publicClient) {
-        try {
-          // Get transaction receipt
-          const receipt = await publicClient.getTransactionReceipt({ hash })
-          
-          // Find DepositIntentCreated event
-          const depositRouterAbi = DEPOSIT_ROUTER_ABI as any
-          
-          if (receipt.logs) {
-            // Decode the event
-            for (const log of receipt.logs) {
-              try {
-                const decoded = publicClient.decodeEventLog({
-                  abi: depositRouterAbi,
-                  eventName: 'DepositIntentCreated',
-                  data: log.data,
-                  topics: log.topics,
-                })
-                
-                if (decoded && decoded.args.intentHash) {
-                  setPendingIntentHash(decoded.args.intentHash)
-                  // Refresh pending intents after a short delay to let indexer catch up
-                  setTimeout(() => {
-                    fetchPendingIntents()
-                  }, 2000)
-                  break
-                }
-              } catch (e) {
-                // Not the event we're looking for
-              }
-            }
-          }
-        } catch (error) {
-          console.error('Error fetching intent hash:', error)
-        }
-      }
+    if (isSuccess && currentTxType === 'deposit' && hash) {
+      setDepositSuccess(true)
+      setDepositHash(hash)
+      setLoading(false)
+      setCurrentTxType(null)
+      
+      setTimeout(() => {
+        fetchPendingIntents()
+      }, 2000)
+      
+      setTimeout(() => {
+        setDepositSuccess(false)
+        setDepositHash(null)
+      }, 10000)
     }
-    
-    fetchIntentHash()
-  }, [isSuccess, currentTxType, hash, publicClient])
-
-  // Get user's nonce from DepositRouter
+  }, [isSuccess, currentTxType, hash, fetchPendingIntents])
   const { data: userNonce } = useReadContract({
     address: DEPOSIT_ROUTER_ADDRESS as Address,
     abi: DEPOSIT_ROUTER_ABI,
     functionName: 'nonces',
     args: address ? [address] : undefined,
-    query: { enabled: !!address && !!DEPOSIT_ROUTER_ADDRESS },
+    query: { 
+      enabled: !!address && !!DEPOSIT_ROUTER_ADDRESS,
+      staleTime: 30 * 1000,
+      refetchOnWindowFocus: false,
+    },
   })
 
   useEffect(() => {
@@ -143,7 +118,6 @@ export default function KOLPage() {
     }
   }, [userNonce])
 
-  // Check USDC allowance - refetch when approval succeeds
   const { data: allowance, refetch: refetchAllowance } = useReadContract({
     address: USDC_ADDRESS as Address,
     abi: ERC20_ABI,
@@ -151,16 +125,17 @@ export default function KOLPage() {
     args: address && DEPOSIT_ROUTER_ADDRESS ? [address, DEPOSIT_ROUTER_ADDRESS as Address] : undefined,
     query: { 
       enabled: !!address && !!DEPOSIT_ROUTER_ADDRESS,
+      staleTime: 10 * 1000,
       refetchInterval: false,
+      refetchOnWindowFocus: false,
     },
   })
 
-  // Refetch allowance when approval transaction succeeds
   useEffect(() => {
     if (isApprovalSuccess) {
       setIsApproving(false)
       setCurrentTxType(null)
-      // Wait a bit for the blockchain state to update, then refetch multiple times
+      resetWriteContract()
       const timers = [
         setTimeout(() => refetchAllowance(), 1000),
         setTimeout(() => refetchAllowance(), 3000),
@@ -168,19 +143,16 @@ export default function KOLPage() {
       ]
       return () => timers.forEach(timer => clearTimeout(timer))
     }
-  }, [isApprovalSuccess, refetchAllowance])
+  }, [isApprovalSuccess, refetchAllowance, resetWriteContract])
 
-  // Also refetch periodically when approval is confirming
   useEffect(() => {
     if (isApprovalConfirming) {
       const interval = setInterval(() => {
         refetchAllowance()
-      }, 2000) // Check every 2 seconds while confirming
+      }, 2000)
       return () => clearInterval(interval)
     }
   }, [isApprovalConfirming, refetchAllowance])
-
-  // Auto-fetch vault state on mount and when vault address changes
   useEffect(() => {
     if (VAULT_ADDRESS && isConnected) {
       fetchVaultState()
@@ -214,7 +186,7 @@ export default function KOLPage() {
     try {
       setIsApproving(true)
       setCurrentTxType('approve')
-      const depositAmount = parseUnits(amount, 6) // USDC has 6 decimals
+      const depositAmount = parseUnits(amount, 6)
       
       writeContract({
         address: USDC_ADDRESS as Address,
@@ -239,11 +211,13 @@ export default function KOLPage() {
     try {
       setLoading(true)
       setCurrentTxType('deposit')
+      setDepositSuccess(false)
+      setDepositHash(null)
+      resetWriteContract()
       
-      const depositAmount = parseUnits(amount, 6) // USDC has 6 decimals
-      const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600) // 1 hour from now
+      const depositAmount = parseUnits(amount, 6)
+      const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600)
 
-      // Create deposit intent
       const intent: DepositIntent = {
         user: address,
         vault: VAULT_ADDRESS as Address,
@@ -253,19 +227,33 @@ export default function KOLPage() {
         deadline: deadline,
       }
 
-      // Sign the intent
-      const signature = await signDepositIntent(intent, chainId)
+      if (!DEPOSIT_ROUTER_ADDRESS || DEPOSIT_ROUTER_ADDRESS === '0x0000000000000000000000000000000000000000') {
+        alert('Contract address not configured. Please set NEXT_PUBLIC_DEPOSIT_ROUTER_ADDRESS in .env file and restart the frontend.')
+        setLoading(false)
+        setCurrentTxType(null)
+        return
+      }
 
-      // Calculate intent hash (same as contract does)
-      const intentHash = await getIntentHash(intent, chainId)
-      setPendingIntentHash(intentHash as `0x${string}`)
+      const signature = await signDepositIntent(intent, chainId, DEPOSIT_ROUTER_ADDRESS as Address)
 
-      // Create intent on-chain
+      console.log('Depositing to contract:', DEPOSIT_ROUTER_ADDRESS)
+      console.log('Intent:', intent)
+      console.log('Signature:', signature)
       writeContract({
         address: DEPOSIT_ROUTER_ADDRESS as Address,
         abi: DEPOSIT_ROUTER_ABI,
-        functionName: 'createDepositIntent',
-        args: [intent, signature as `0x${string}`],
+        functionName: 'depositWithIntent',
+        args: [
+          [
+            intent.user,
+            intent.vault,
+            intent.asset,
+            intent.amount,
+            intent.nonce,
+            intent.deadline
+          ],
+          signature as `0x${string}`
+        ],
       })
       
     } catch (error) {
@@ -281,7 +269,6 @@ export default function KOLPage() {
     let hashToExecute: `0x${string}` | null = null
     
     if (intentHash) {
-      // Handle various input types
       let hashStr: string | null = null
       
       if (typeof intentHash === 'string') {
@@ -308,7 +295,6 @@ export default function KOLPage() {
       setCurrentTxType('execute')
       setPendingIntentHash(hashToExecute)
       
-      // First, check if the intent is valid
       const isValid = await publicClient?.readContract({
         address: DEPOSIT_ROUTER_ADDRESS as Address,
         abi: DEPOSIT_ROUTER_ABI,
@@ -317,7 +303,6 @@ export default function KOLPage() {
       })
 
       if (!isValid) {
-        // Get the deposit record to see why it's invalid
         const depositRecord = await publicClient?.readContract({
           address: DEPOSIT_ROUTER_ADDRESS as Address,
           abi: DEPOSIT_ROUTER_ABI,
@@ -341,7 +326,6 @@ export default function KOLPage() {
         return
       }
 
-      // Check allowance before executing
       const currentAllowance = await publicClient?.readContract({
         address: USDC_ADDRESS as Address,
         abi: ERC20_ABI,
@@ -363,16 +347,12 @@ export default function KOLPage() {
         return
       }
       
-      // Execute the deposit intent
-      // Note: writeContract doesn't return a promise - errors are handled via hook state
       writeContract({
         address: DEPOSIT_ROUTER_ADDRESS as Address,
         abi: DEPOSIT_ROUTER_ABI,
         functionName: 'executeDeposit',
         args: [hashToExecute],
       })
-      
-      // Don't set loading to false here - let useEffect handle it based on transaction state
       
     } catch (error: any) {
       console.error('Execute deposit failed:', error)
@@ -382,7 +362,6 @@ export default function KOLPage() {
     }
   }
 
-  // Handle writeContract errors (simulation failures)
   useEffect(() => {
     if (writeError && currentTxType === 'execute') {
       console.log('Write error detected:', writeError)
@@ -408,7 +387,6 @@ export default function KOLPage() {
     }
   }, [writeError, currentTxType, resetWriteContract])
 
-  // Handle transaction receipt errors
   useEffect(() => {
     if (isReceiptError && currentTxType === 'execute') {
       setLoading(false)
@@ -426,7 +404,6 @@ export default function KOLPage() {
     }
   }, [isReceiptError, receiptError, currentTxType, resetWriteContract])
 
-  // Reset loading state when transaction succeeds
   useEffect(() => {
     if (isSuccess && currentTxType === 'execute') {
       setLoading(false)
@@ -434,20 +411,16 @@ export default function KOLPage() {
       setExecuteSuccess(true)
       setExecutedHash(hash || null)
       
-      // Remove the executed intent from the list immediately
       if (pendingIntentHash) {
         setPendingIntents(prev => prev.filter(i => i.intentHash !== pendingIntentHash))
       }
       
-      // Show success alert
       alert('✅ Deposit executed successfully! Your USDC has been deposited to the vault.')
       
-      // Refresh pending intents after a short delay
       setTimeout(() => {
         fetchPendingIntents()
       }, 2000)
       
-      // Clear success state after 10 seconds
       setTimeout(() => {
         setExecuteSuccess(false)
         setExecutedHash(null)
@@ -485,7 +458,6 @@ export default function KOLPage() {
         <h1 className="text-3xl sm:text-4xl font-bold mb-6 sm:mb-8">KOL Landing Page</h1>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 sm:gap-8">
-          {/* Deposit Section */}
           <div className="border-2 border-black p-6 sm:p-8">
             <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">Deposit USDC</h2>
             
@@ -546,7 +518,7 @@ export default function KOLPage() {
                 disabled={loading || isPending || !amount || (allowance !== undefined && allowance < parseUnits(amount, 6))}
                 className="w-full bg-black text-white py-3 px-6 font-bold hover:bg-gray-800 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
               >
-                {loading || isPending ? 'Processing...' : 'Create Deposit Intent'}
+                {loading || isPending ? 'Depositing...' : 'Deposit to Vault'}
               </button>
 
               {isConfirming && (
@@ -555,23 +527,11 @@ export default function KOLPage() {
                 </div>
               )}
 
-              {isSuccess && currentTxType === 'deposit' && (
+              {depositSuccess && (
                 <div className="p-4 bg-green-50 border-2 border-green-500 rounded">
-                  <p className="font-semibold text-green-800">Deposit Intent Created!</p>
-                  <p className="text-xs text-green-600 mt-1 break-all">Tx Hash: {hash}</p>
-                  {pendingIntentHash && (
-                    <div className="mt-3">
-                      <p className="text-sm font-semibold text-green-800 mb-2">Next Step: Execute Deposit</p>
-                      <p className="text-xs text-gray-600 mb-2">This will transfer your USDC to the vault.</p>
-                      <button
-                        onClick={handleExecuteDeposit}
-                        disabled={loading || isPending || isConfirming}
-                        className="w-full bg-green-600 text-white py-2 px-4 font-bold hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
-                      >
-                        {loading || isPending ? 'Executing...' : 'Execute Deposit (Transfer USDC)'}
-                      </button>
-                    </div>
-                  )}
+                  <p className="font-semibold text-green-800">✅ Deposit Successful!</p>
+                  <p className="text-sm text-green-700 mt-1">Your USDC has been deposited to the vault.</p>
+                  {depositHash && <p className="text-xs text-green-600 mt-2 break-all">Tx Hash: {depositHash}</p>}
                 </div>
               )}
 
@@ -586,10 +546,10 @@ export default function KOLPage() {
             </div>
           </div>
 
-          {/* Pending Intents Section */}
+          {pendingIntents.length > 0 && (
           <div className="border-2 border-black p-6 sm:p-8">
             <div className="flex justify-between items-center mb-4 sm:mb-6">
-              <h2 className="text-xl sm:text-2xl font-bold">Pending Deposit Intents</h2>
+              <h2 className="text-xl sm:text-2xl font-bold">Pending Deposit Intents (Legacy)</h2>
               <button
                 onClick={fetchPendingIntents}
                 disabled={loadingIntents || !address}
@@ -622,13 +582,11 @@ export default function KOLPage() {
                     </div>
                     <button
                       onClick={() => {
-                        // Extract and format the intent hash properly
                         let hash: string | null = null
                         
                         if (typeof intent.intentHash === 'string') {
                           hash = intent.intentHash.startsWith('0x') ? intent.intentHash : `0x${intent.intentHash}`
                         } else if (intent.intentHash && typeof intent.intentHash === 'object') {
-                          // If it's an object, try to extract the value
                           hash = intent.intentHash.toString()
                           if (!hash.startsWith('0x')) hash = `0x${hash}`
                         }
@@ -650,8 +608,8 @@ export default function KOLPage() {
               </div>
             )}
           </div>
+          )}
 
-          {/* Vault Information Section */}
           <div className="border-2 border-black p-6 sm:p-8">
             <div className="flex justify-between items-center mb-4 sm:mb-6">
               <h2 className="text-xl sm:text-2xl font-bold">Vault Information</h2>
@@ -666,13 +624,11 @@ export default function KOLPage() {
 
             {vaultState ? (
               <div className="space-y-4 overflow-hidden">
-                {/* Vault Name */}
                 <div className="pb-3 border-b-2 border-black">
                   <h3 className="text-lg sm:text-xl font-bold break-words">{vaultState.name || 'Turtle Avalanche USDC'}</h3>
                   <p className="text-xs text-gray-600 mt-1 break-all font-mono">{VAULT_ADDRESS}</p>
                 </div>
 
-                {/* Key Metrics */}
                 <div className="grid grid-cols-2 gap-3 sm:gap-4">
                   <div className="border border-gray-300 p-3 bg-gray-50">
                     <p className="text-xs text-gray-600 mb-1">Total Assets</p>
@@ -694,7 +650,6 @@ export default function KOLPage() {
                   </div>
                 </div>
 
-                {/* Share Price */}
                 {vaultState.sharePriceFormatted && (
                   <div className="border-2 border-black p-3 sm:p-4 bg-gray-50">
                     <p className="text-xs text-gray-600 mb-1">Share Price</p>
@@ -705,7 +660,6 @@ export default function KOLPage() {
                   </div>
                 )}
 
-                {/* Epoch Information */}
                 <div className="space-y-2 pt-2 border-t border-gray-300">
                   <div className="flex justify-between items-center text-sm">
                     <span className="text-gray-600">Deposit Epoch:</span>
@@ -725,7 +679,6 @@ export default function KOLPage() {
                   </div>
                 </div>
 
-                {/* Vault State */}
                 <div className="pt-2 border-t border-gray-300">
                   <div className="flex justify-between items-center text-sm">
                     <span className="text-gray-600">Vault State:</span>
@@ -741,7 +694,6 @@ export default function KOLPage() {
                   </div>
                 </div>
 
-                {/* Links */}
                 <div className="pt-3 border-t border-gray-300">
                   <a 
                     href={`https://snowtrace.io/address/${VAULT_ADDRESS}`}

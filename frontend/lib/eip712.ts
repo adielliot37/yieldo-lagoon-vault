@@ -28,13 +28,20 @@ export interface DepositIntent {
 
 export async function signDepositIntent(
   intent: DepositIntent,
-  chainId: number
+  chainId: number,
+  contractAddress?: Address
 ): Promise<string> {
+  const verifyingContract = contractAddress || (process.env.NEXT_PUBLIC_DEPOSIT_ROUTER_ADDRESS as Address)
+  
+  if (!verifyingContract) {
+    throw new Error('Contract address not set. Please configure NEXT_PUBLIC_DEPOSIT_ROUTER_ADDRESS in .env')
+  }
+
   const domain = {
     name: DOMAIN_NAME,
     version: DOMAIN_VERSION,
     chainId,
-    verifyingContract: process.env.NEXT_PUBLIC_DEPOSIT_ROUTER_ADDRESS as Address,
+    verifyingContract,
   }
 
   const signature = await signTypedData(wagmiConfig, {
@@ -54,16 +61,13 @@ export async function signDepositIntent(
   return signature
 }
 
-// Utility function to compute intent hash (matches contract's keccak256)
 export async function getIntentHash(intent: DepositIntent, chainId: number): Promise<`0x${string}`> {
-  // This matches the contract's DEPOSIT_INTENT_TYPEHASH calculation
   const TYPEHASH = keccak256(
     new TextEncoder().encode(
       'DepositIntent(address user,address vault,address asset,uint256 amount,uint256 nonce,uint256 deadline)'
     )
   )
   
-  // Encode the struct hash (same as contract does)
   const structHash = keccak256(
     encodePacked(
       ['bytes32', 'address', 'address', 'address', 'uint256', 'uint256', 'uint256'],
@@ -79,9 +83,6 @@ export async function getIntentHash(intent: DepositIntent, chainId: number): Pro
     )
   )
   
-  // Note: In the contract, this would be hashed with the domain separator
-  // For now, we return the struct hash - the contract will compute the full hash
-  // But we can use this to identify intents
   return structHash
 }
 

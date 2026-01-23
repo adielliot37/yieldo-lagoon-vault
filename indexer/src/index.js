@@ -146,6 +146,18 @@ async function indexDepositRouterEvents(fromBlock, toBlock) {
       console.log(`Deposit executed: ${intentHash} for user ${user}, amount: ${amount.toString()}`);
     }
 
+    const feeCollectedLogs = await client.getLogs({
+      address: DEPOSIT_ROUTER_ADDRESS,
+      event: parseAbiItem('event FeeCollected(bytes32 indexed intentHash, address indexed asset, uint256 feeAmount)'),
+      fromBlock,
+      toBlock,
+    });
+
+    for (const log of feeCollectedLogs) {
+      const { intentHash, asset, feeAmount } = log.args;
+      console.log(`Fee collected: ${feeAmount.toString()} for intent ${intentHash}`);
+    }
+
     const intentCancelledLogs = await client.getLogs({
       address: DEPOSIT_ROUTER_ADDRESS,
       event: parseAbiItem('event DepositIntentCancelled(bytes32 indexed intentHash, address indexed user)'),

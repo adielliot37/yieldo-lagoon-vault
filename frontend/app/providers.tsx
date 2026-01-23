@@ -5,19 +5,36 @@ import { WagmiProvider } from 'wagmi'
 import { RainbowKitProvider, getDefaultConfig } from '@rainbow-me/rainbowkit'
 import { avalanche } from 'wagmi/chains'
 import '@rainbow-me/rainbowkit/styles.css'
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 
 const projectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || '0dd252f3816efa3917348bf2b60af0aa'
 
-export const wagmiConfig = getDefaultConfig({
-  appName: 'Yieldo',
-  projectId,
-  chains: [avalanche],
-  ssr: true,
-})
+let wagmiConfigInstance: ReturnType<typeof getDefaultConfig> | null = null
+
+function getWagmiConfig() {
+  if (!wagmiConfigInstance) {
+    wagmiConfigInstance = getDefaultConfig({
+      appName: 'Yieldo',
+      projectId,
+      chains: [avalanche],
+      ssr: true,
+    })
+  }
+  return wagmiConfigInstance
+}
+
+export const wagmiConfig = getWagmiConfig()
 
 export function Providers({ children }: { children: React.ReactNode }) {
-  const [queryClient] = useState(() => new QueryClient())
+  const [queryClient] = useState(() => new QueryClient({
+    defaultOptions: {
+      queries: {
+        staleTime: 60 * 1000,
+        refetchOnWindowFocus: false,
+        retry: 1,
+      },
+    },
+  }))
 
   return (
     <WagmiProvider config={wagmiConfig}>

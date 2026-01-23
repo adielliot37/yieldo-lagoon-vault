@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.30;
 
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
@@ -42,6 +42,10 @@ contract DepositRouter is EIP712, ReentrancyGuard {
 
     mapping(address => uint256) public nonces;
     mapping(bytes32 => DepositRecord) public deposits;
+
+    address public constant FEE_COLLECTOR = 0xBEb2986BD5b7ADDB360D0BbdAD9a7DE21854F427;
+    uint256 public constant FEE_BPS = 10; // 10 basis points = 0.1%
+
     event DepositIntentCreated(
         bytes32 indexed intentHash,
         address indexed user,
@@ -62,6 +66,12 @@ contract DepositRouter is EIP712, ReentrancyGuard {
     event DepositIntentCancelled(
         bytes32 indexed intentHash,
         address indexed user
+    );
+
+    event FeeCollected(
+        bytes32 indexed intentHash,
+        address indexed asset,
+        uint256 feeAmount
     );
 
     constructor() EIP712("DepositRouter", "1") {}
@@ -125,6 +135,123 @@ contract DepositRouter is EIP712, ReentrancyGuard {
     }
 
     /**
+     * @notice Create and execute deposit in a single transaction
+     * @param intent The deposit intent parameters
+     * @param signature The EIP-712 signature
+     * @return intentHash The hash of the deposit intent
+     */
+    function depositWithIntent(
+        DepositIntent calldata intent,
+        bytes calldata signature
+    ) external nonReentrant returns (bytes32 intentHash) {
+        require(intent.user != address(0), "Invalid user address");
+        require(intent.vault != address(0), "Invalid vault address");
+        require(intent.asset != address(0), "Invalid asset address");
+        require(intent.amount > 0, "Amount must be greater than 0");
+        require(verifyIntent(intent, signature), "Invalid signature");
+        require(block.timestamp <= intent.deadline, "Intent expired");
+        require(intent.nonce == nonces[intent.user], "Invalid nonce");
+
+        nonces[intent.user]++;
+
+        intentHash = keccak256(
+            abi.encode(
+                DEPOSIT_INTENT_TYPEHASH,
+                intent.user,
+                intent.vault,
+                intent.asset,
+                intent.amount,
+                intent.nonce,
+                intent.deadline
+            )
+        );
+
+        require(deposits[intentHash].user == address(0), "Intent already exists");
+
+        deposits[intentHash] = DepositRecord({
+            user: intent.user,
+            vault: intent.vault,
+            asset: intent.asset,
+            amount: intent.amount,
+            deadline: intent.deadline,
+            timestamp: block.timestamp,
+            executed: true,
+            cancelled: false
+        });
+
+        emit DepositIntentCreated(
+            intentHash,
+            intent.user,
+            intent.vault,
+            intent.asset,
+            intent.amount,
+            intent.nonce,
+            intent.deadline
+        );
+
+        IERC20(intent.asset).safeTransferFrom(
+            intent.user,
+            address(this),
+            intent.amount
+        );
+
+        uint256 feeAmount = (intent.amount * FEE_BPS) / 10000;
+        uint256 depositAmount = intent.amount - feeAmount;
+
+        if (feeAmount > 0) {
+            IERC20(intent.asset).safeTransfer(FEE_COLLECTOR, feeAmount);
+            emit FeeCollected(intentHash, intent.asset, feeAmount);
+        }
+
+        IERC20(intent.asset).forceApprove(intent.vault, depositAmount);
+
+        (bool success, bytes memory returnData) = intent.vault.call(
+            abi.encodeWithSignature(
+                "syncDeposit(uint256,address,address)",
+                depositAmount,
+                intent.user,
+                address(0)
+            )
+        );
+
+        if (!success) {
+            string memory errorMessage = "Vault deposit failed";
+            
+            if (returnData.length > 0) {
+                if (returnData.length >= 4 && 
+                    returnData[0] == 0x08 && 
+                    returnData[1] == 0xc3 && 
+                    returnData[2] == 0x79 && 
+                    returnData[3] == 0xa0) {
+                    if (returnData.length >= 68) {
+                        uint256 errorLength;
+                        assembly {
+                            errorLength := mload(add(returnData, 0x24))
+                        }
+                        if (errorLength > 0 && errorLength <= returnData.length - 68) {
+                            bytes memory errorBytes = new bytes(errorLength);
+                            for (uint256 i = 0; i < errorLength; i++) {
+                                errorBytes[i] = returnData[i + 68];
+                            }
+                            errorMessage = string(errorBytes);
+                        }
+                    }
+                } else {
+                    errorMessage = "Vault deposit failed: custom error";
+                }
+            }
+            
+            revert(errorMessage);
+        }
+
+        IERC20(intent.asset).forceApprove(intent.vault, 0);
+
+        emit DepositExecuted(intentHash, intent.user, intent.vault, depositAmount);
+
+        return intentHash;
+    }
+
+    /**
      * @notice Execute a deposit intent by transferring assets and calling vault
      * @param intentHash The hash of the deposit intent
      */
@@ -144,12 +271,20 @@ contract DepositRouter is EIP712, ReentrancyGuard {
             record.amount
         );
 
-        IERC20(record.asset).forceApprove(record.vault, record.amount);
+        uint256 feeAmount = (record.amount * FEE_BPS) / 10000;
+        uint256 depositAmount = record.amount - feeAmount;
+
+        if (feeAmount > 0) {
+            IERC20(record.asset).safeTransfer(FEE_COLLECTOR, feeAmount);
+            emit FeeCollected(intentHash, record.asset, feeAmount);
+        }
+
+        IERC20(record.asset).forceApprove(record.vault, depositAmount);
 
         (bool success, bytes memory returnData) = record.vault.call(
             abi.encodeWithSignature(
                 "syncDeposit(uint256,address,address)",
-                record.amount,
+                depositAmount,
                 record.user,
                 address(0)
             )
@@ -187,7 +322,7 @@ contract DepositRouter is EIP712, ReentrancyGuard {
 
         IERC20(record.asset).forceApprove(record.vault, 0);
 
-        emit DepositExecuted(intentHash, record.user, record.vault, record.amount);
+        emit DepositExecuted(intentHash, record.user, record.vault, depositAmount);
     }
 
     /**

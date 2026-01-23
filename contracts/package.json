@@ -12,10 +12,10 @@
     "@nomicfoundation/hardhat-toolbox": "^4.0.0",
     "@openzeppelin/contracts": "^5.0.0",
     "dotenv": "^16.3.1",
-    "hardhat": "^2.19.0"
+    "hardhat": "^2.19.0",
+    "solc": "^0.8.33"
   },
   "dependencies": {
     "ethers": "^6.8.0"
   }
 }
-
