@@ -24,7 +24,7 @@ export default function KOLPage() {
   const [amount, setAmount] = useState('')
   const [vaultState, setVaultState] = useState<any>(null)
   const [loading, setLoading] = useState(false)
-  const [nonce, setNonce] = useState<bigint>(0n)
+  const [nonce, setNonce] = useState<bigint>(BigInt(0))
   const [approvalHash, setApprovalHash] = useState<`0x${string}` | undefined>()
   const [isApproving, setIsApproving] = useState(false)
   const [currentTxType, setCurrentTxType] = useState<'approve' | 'deposit' | 'execute' | null>(null)
@@ -633,7 +633,7 @@ export default function KOLPage() {
                   <div className="border border-gray-300 p-3 bg-gray-50">
                     <p className="text-xs text-gray-600 mb-1">Total Assets</p>
                     <p className="text-base sm:text-lg font-bold break-words">
-                      {Number(formatUnits(vaultState.totalAssets || 0n, vaultState.underlyingDecimals || 6)).toLocaleString('en-US', {
+                      {Number(formatUnits(vaultState.totalAssets || BigInt(0), vaultState.underlyingDecimals || 6)).toLocaleString('en-US', {
                         maximumFractionDigits: 2
                       })}
                     </p>
@@ -642,7 +642,7 @@ export default function KOLPage() {
                   <div className="border border-gray-300 p-3 bg-gray-50">
                     <p className="text-xs text-gray-600 mb-1">Total Supply</p>
                     <p className="text-base sm:text-lg font-bold break-words">
-                      {Number(formatUnits(vaultState.totalSupply || 0n, vaultState.decimals || 18)).toLocaleString('en-US', {
+                      {Number(formatUnits(vaultState.totalSupply || BigInt(0), vaultState.decimals || 18)).toLocaleString('en-US', {
                         maximumFractionDigits: 6
                       })}
                     </p>
