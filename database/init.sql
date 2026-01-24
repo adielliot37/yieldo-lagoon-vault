@@ -71,3 +71,4 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_date ON snapshots(date);
 CREATE INDEX IF NOT EXISTS idx_snapshots_vault ON snapshots(vault_address);
 
 
+

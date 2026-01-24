@@ -88,6 +88,12 @@ async function indexDepositRouterEvents(fromBlock, toBlock) {
   if (!DEPOSIT_ROUTER_ADDRESS) return;
 
   try {
+    // Ensure we don't query blocks that haven't been finalized
+    if (fromBlock > toBlock) {
+      console.warn(`Invalid block range: fromBlock ${fromBlock} > toBlock ${toBlock}`);
+      return;
+    }
+
     const intentCreatedLogs = await client.getLogs({
       address: DEPOSIT_ROUTER_ADDRESS,
       event: parseAbiItem('event DepositIntentCreated(bytes32 indexed intentHash, address indexed user, address indexed vault, address asset, uint256 amount, uint256 nonce, uint256 deadline)'),
@@ -185,6 +191,11 @@ async function indexDepositRouterEvents(fromBlock, toBlock) {
       );
     }
   } catch (error) {
+    // Handle "block not accepted" errors gracefully
+    if (error.message && (error.message.includes('after last accepted block') || error.message.includes('requested from block'))) {
+      console.warn(`Block range ${fromBlock}-${toBlock} not yet finalized, skipping this iteration`);
+      return;
+    }
     console.error('Error indexing DepositRouter events:', error);
   }
 }
@@ -193,6 +204,12 @@ async function indexVaultEvents(fromBlock, toBlock) {
   if (!VAULT_ADDRESS) return;
 
   try {
+    // Ensure we don't query blocks that haven't been finalized
+    if (fromBlock > toBlock) {
+      console.warn(`Invalid block range: fromBlock ${fromBlock} > toBlock ${toBlock}`);
+      return;
+    }
+
     // Index DepositRequested events
     // Try ERC-7540 standard event first: DepositRequest(address indexed controller, address indexed owner, uint256 indexed requestId, address sender, uint256 assets)
     let depositRequestedLogs = [];
@@ -311,6 +328,11 @@ async function indexVaultEvents(fromBlock, toBlock) {
 
     // These will be used in daily snapshots
   } catch (error) {
+    // Handle "block not accepted" errors gracefully
+    if (error.message && (error.message.includes('after last accepted block') || error.message.includes('requested from block'))) {
+      console.warn(`Block range ${fromBlock}-${toBlock} not yet finalized, skipping this iteration`);
+      return;
+    }
     console.error('Error indexing vault events:', error);
   }
 }
@@ -386,12 +408,16 @@ async function startIndexing() {
   // Index every 10 seconds
   setInterval(async () => {
     try {
-      const currentBlock = await client.getBlockNumber();
-      const toBlock = currentBlock;
+      // Get the latest block, but subtract a safety margin for Avalanche finality
+      // Avalanche requires blocks to be "accepted" before querying logs
+      const latestBlock = await client.getBlockNumber();
+      // Use a safety margin of 10 blocks to ensure we only query finalized blocks
+      const SAFETY_MARGIN = 10n;
+      const toBlock = latestBlock > SAFETY_MARGIN ? latestBlock - SAFETY_MARGIN : latestBlock;
       const fromBlock = lastProcessedBlock + 1n;
 
       if (fromBlock <= toBlock) {
-        console.log(`Indexing blocks ${fromBlock} to ${toBlock}`);
+        console.log(`Indexing blocks ${fromBlock} to ${toBlock} (latest: ${latestBlock})`);
         await indexDepositRouterEvents(fromBlock, toBlock);
         await indexVaultEvents(fromBlock, toBlock);
         lastProcessedBlock = toBlock;
@@ -403,7 +429,33 @@ async function startIndexing() {
         );
       }
     } catch (error) {
-      console.error('Error in indexing loop:', error);
+      // If we get a "block not accepted" error, try with a smaller block range
+      if (error.message && error.message.includes('after last accepted block')) {
+        console.warn('Block not yet accepted, retrying with smaller range...');
+        try {
+          const latestBlock = await client.getBlockNumber();
+          const SAFETY_MARGIN = 50n; // Use larger margin on retry
+          const toBlock = latestBlock > SAFETY_MARGIN ? latestBlock - SAFETY_MARGIN : latestBlock;
+          const fromBlock = lastProcessedBlock + 1n;
+
+          if (fromBlock <= toBlock) {
+            console.log(`Retrying: Indexing blocks ${fromBlock} to ${toBlock} (latest: ${latestBlock})`);
+            await indexDepositRouterEvents(fromBlock, toBlock);
+            await indexVaultEvents(fromBlock, toBlock);
+            lastProcessedBlock = toBlock;
+
+            await colMeta.updateOne(
+              { _id: 'lastProcessedBlock' },
+              { $set: { value: lastProcessedBlock.toString(), updated_at: new Date() } },
+              { upsert: true }
+            );
+          }
+        } catch (retryError) {
+          console.error('Error in retry indexing loop:', retryError);
+        }
+      } else {
+        console.error('Error in indexing loop:', error);
+      }
     }
   }, 10000); // Every 10 seconds
 
