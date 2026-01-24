@@ -191,12 +191,14 @@ async function indexDepositRouterEvents(fromBlock, toBlock) {
       );
     }
   } catch (error) {
-    // Handle "block not accepted" errors gracefully
+    // Handle "block not accepted" errors - throw so main loop can handle it
     if (error.message && (error.message.includes('after last accepted block') || error.message.includes('requested from block'))) {
-      console.warn(`Block range ${fromBlock}-${toBlock} not yet finalized, skipping this iteration`);
-      return;
+      const finalityError = new Error(`Block range ${fromBlock}-${toBlock} not yet finalized`);
+      finalityError.name = 'BlockNotFinalizedError';
+      throw finalityError;
     }
     console.error('Error indexing DepositRouter events:', error);
+    throw error; // Re-throw other errors
   }
 }
 
@@ -328,12 +330,14 @@ async function indexVaultEvents(fromBlock, toBlock) {
 
     // These will be used in daily snapshots
   } catch (error) {
-    // Handle "block not accepted" errors gracefully
+    // Handle "block not accepted" errors - throw so main loop can handle it
     if (error.message && (error.message.includes('after last accepted block') || error.message.includes('requested from block'))) {
-      console.warn(`Block range ${fromBlock}-${toBlock} not yet finalized, skipping this iteration`);
-      return;
+      const finalityError = new Error(`Block range ${fromBlock}-${toBlock} not yet finalized`);
+      finalityError.name = 'BlockNotFinalizedError';
+      throw finalityError;
     }
     console.error('Error indexing vault events:', error);
+    throw error; // Re-throw other errors
   }
 }
 
@@ -405,57 +409,98 @@ async function startIndexing() {
 
   console.log(`Starting indexing from block ${lastProcessedBlock}`);
 
+  // Helper function to get a safe block number that's definitely finalized
+  // Avalanche requires blocks to be "accepted" before logs can be queried
+  // Based on network conditions, this can take 20-100+ blocks
+  // We use a configurable but conservative default margin
+  async function getSafeBlockNumber() {
+    const latestBlock = await client.getBlockNumber();
+    // Use a large safety margin - can be configured via env var, default 60 blocks
+    // This ensures we only query blocks that are definitely finalized
+    const SAFETY_MARGIN = BigInt(process.env.AVALANCHE_SAFETY_MARGIN || '60');
+    const safeBlock = latestBlock > SAFETY_MARGIN ? latestBlock - SAFETY_MARGIN : latestBlock;
+    return safeBlock;
+  }
+
+  // Function to backfill a specific block range (for missed blocks)
+  async function backfillBlockRange(fromBlock, toBlock) {
+    try {
+      console.log(`Backfilling blocks ${fromBlock} to ${toBlock}`);
+      await indexDepositRouterEvents(fromBlock, toBlock);
+      await indexVaultEvents(fromBlock, toBlock);
+      console.log(`Successfully backfilled blocks ${fromBlock} to ${toBlock}`);
+      return true;
+    } catch (error) {
+      console.error(`Error backfilling blocks ${fromBlock} to ${toBlock}:`, error);
+      return false;
+    }
+  }
+
   // Index every 10 seconds
   setInterval(async () => {
     try {
-      // Get the latest block, but subtract a safety margin for Avalanche finality
-      // Avalanche requires blocks to be "accepted" before querying logs
       const latestBlock = await client.getBlockNumber();
-      // Use a safety margin of 10 blocks to ensure we only query finalized blocks
-      const SAFETY_MARGIN = 10n;
-      const toBlock = latestBlock > SAFETY_MARGIN ? latestBlock - SAFETY_MARGIN : latestBlock;
+      const safeBlock = await getSafeBlockNumber();
       const fromBlock = lastProcessedBlock + 1n;
+      const toBlock = safeBlock;
 
       if (fromBlock <= toBlock) {
-        console.log(`Indexing blocks ${fromBlock} to ${toBlock} (latest: ${latestBlock})`);
-        await indexDepositRouterEvents(fromBlock, toBlock);
-        await indexVaultEvents(fromBlock, toBlock);
-        lastProcessedBlock = toBlock;
+        console.log(`Indexing blocks ${fromBlock} to ${toBlock} (latest: ${latestBlock}, safe: ${safeBlock})`);
+        
+        // Try indexing, but only update lastProcessedBlock if successful
+        try {
+          await indexDepositRouterEvents(fromBlock, toBlock);
+          await indexVaultEvents(fromBlock, toBlock);
+          
+          // Only update lastProcessedBlock if indexing was successful
+          lastProcessedBlock = toBlock;
+          await colMeta.updateOne(
+            { _id: 'lastProcessedBlock' },
+            { $set: { value: lastProcessedBlock.toString(), updated_at: new Date() } },
+            { upsert: true }
+          );
+        } catch (indexError) {
+          // If indexing fails due to block finality, don't update lastProcessedBlock
+          if (indexError.name === 'BlockNotFinalizedError' || 
+              (indexError.message && (
+                indexError.message.includes('after last accepted block') || 
+                indexError.message.includes('requested from block') ||
+                indexError.message.includes('not yet finalized')
+              ))) {
+            // Silently skip - blocks will be indexed in next iteration
+            return; // Exit early, don't update lastProcessedBlock
+          }
+          throw indexError; // Re-throw if it's a different error
+        }
+      }
+
+      // Periodically check for gaps and backfill them (every 5 minutes)
+      // This helps catch any blocks that were missed due to errors or finality issues
+      const now = Date.now();
+      const lastGapCheck = await colMeta.findOne({ _id: 'lastGapCheck' });
+      const GAP_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+      if (!lastGapCheck || (now - lastGapCheck.value) > GAP_CHECK_INTERVAL) {
+        // Check for gaps in the last 1000 blocks
+        const checkFromBlock = lastProcessedBlock > 1000n ? lastProcessedBlock - 1000n : 0n;
+        const checkToBlock = lastProcessedBlock;
+        
+        // This is a simple check - in production you might want more sophisticated gap detection
+        // For now, we'll just try to backfill any blocks that are significantly behind
+        if (checkFromBlock < lastProcessedBlock) {
+          console.log(`Checking for gaps between blocks ${checkFromBlock} and ${checkToBlock}`);
+          // Note: Actual gap detection would require checking which blocks have events
+          // For now, this is a placeholder - you can enhance it later
+        }
 
         await colMeta.updateOne(
-          { _id: 'lastProcessedBlock' },
-          { $set: { value: lastProcessedBlock.toString(), updated_at: new Date() } },
+          { _id: 'lastGapCheck' },
+          { $set: { value: now, updated_at: new Date() } },
           { upsert: true }
         );
       }
     } catch (error) {
-      // If we get a "block not accepted" error, try with a smaller block range
-      if (error.message && error.message.includes('after last accepted block')) {
-        console.warn('Block not yet accepted, retrying with smaller range...');
-        try {
-          const latestBlock = await client.getBlockNumber();
-          const SAFETY_MARGIN = 50n; // Use larger margin on retry
-          const toBlock = latestBlock > SAFETY_MARGIN ? latestBlock - SAFETY_MARGIN : latestBlock;
-          const fromBlock = lastProcessedBlock + 1n;
-
-          if (fromBlock <= toBlock) {
-            console.log(`Retrying: Indexing blocks ${fromBlock} to ${toBlock} (latest: ${latestBlock})`);
-            await indexDepositRouterEvents(fromBlock, toBlock);
-            await indexVaultEvents(fromBlock, toBlock);
-            lastProcessedBlock = toBlock;
-
-            await colMeta.updateOne(
-              { _id: 'lastProcessedBlock' },
-              { $set: { value: lastProcessedBlock.toString(), updated_at: new Date() } },
-              { upsert: true }
-            );
-          }
-        } catch (retryError) {
-          console.error('Error in retry indexing loop:', retryError);
-        }
-      } else {
-        console.error('Error in indexing loop:', error);
-      }
+      console.error('Error in indexing loop:', error);
     }
   }, 10000); // Every 10 seconds
 
@@ -535,6 +580,96 @@ app.get('/api/intents', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', lastBlock: lastProcessedBlock?.toString() });
+});
+
+// Backfill endpoint to re-index specific block ranges
+app.post('/api/backfill', async (req, res) => {
+  try {
+    const { fromBlock, toBlock } = req.body;
+    
+    if (!fromBlock || !toBlock) {
+      return res.status(400).json({ error: 'fromBlock and toBlock are required' });
+    }
+
+    const from = BigInt(fromBlock);
+    const to = BigInt(toBlock);
+
+    if (from > to) {
+      return res.status(400).json({ error: 'fromBlock must be <= toBlock' });
+    }
+
+    console.log(`Manual backfill requested for blocks ${from} to ${to}`);
+    
+    try {
+      await indexDepositRouterEvents(from, to);
+      await indexVaultEvents(from, to);
+      
+      res.json({ 
+        success: true, 
+        message: `Backfilled blocks ${from} to ${to}`,
+        fromBlock: from.toString(),
+        toBlock: to.toString()
+      });
+    } catch (backfillError) {
+      // If it's a finality error, still return success but with a warning
+      if (backfillError.name === 'BlockNotFinalizedError' || 
+          (backfillError.message && backfillError.message.includes('not yet finalized'))) {
+        res.status(202).json({ 
+          success: true, 
+          warning: 'Some blocks may not be finalized yet',
+          message: `Attempted to backfill blocks ${from} to ${to}`,
+          fromBlock: from.toString(),
+          toBlock: to.toString()
+        });
+      } else {
+        throw backfillError;
+      }
+    }
+  } catch (error) {
+    console.error('Error in backfill:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Endpoint to backfill a single block
+app.post('/api/backfill/block', async (req, res) => {
+  try {
+    const { blockNumber } = req.body;
+    
+    if (!blockNumber) {
+      return res.status(400).json({ error: 'blockNumber is required' });
+    }
+
+    const block = BigInt(blockNumber);
+    console.log(`Manual backfill requested for block ${block}`);
+    
+    try {
+      await indexDepositRouterEvents(block, block);
+      await indexVaultEvents(block, block);
+      
+      res.json({ 
+        success: true, 
+        message: `Backfilled block ${block}`,
+        blockNumber: block.toString()
+      });
+    } catch (backfillError) {
+      // If it's a finality error, still return success but with a warning
+      if (backfillError.name === 'BlockNotFinalizedError' || 
+          (backfillError.message && backfillError.message.includes('not yet finalized'))) {
+        res.status(202).json({ 
+          success: true, 
+          warning: 'Block may not be finalized yet',
+          message: `Attempted to backfill block ${block}`,
+          blockNumber: block.toString()
+        });
+      } else {
+        throw backfillError;
+      }
+    }
+  } catch (error) {
+    console.error('Error in block backfill:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 const PORT = process.env.PORT || 3001;
