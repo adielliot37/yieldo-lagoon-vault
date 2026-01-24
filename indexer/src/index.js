@@ -329,15 +329,38 @@ async function indexVaultEvents(fromBlock, toBlock) {
             continue;
           }
           
+          // Validate log structure before decoding
+          // ERC-7540 RedeemRequest should have:
+          // - 4 topics: [eventSig, controller, owner, requestId]
+          // - Data: sender (32 bytes) + shares (32 bytes) = 64 bytes = 130 chars (with 0x prefix)
+          if (log.topics.length !== 4) {
+            console.log(`Skipping log ${log.transactionHash}: expected 4 topics, got ${log.topics.length}`);
+            continue;
+          }
+          
+          if (!log.data || log.data.length < 130) {
+            console.log(`Skipping log ${log.transactionHash}: data too short (expected 130 chars, got ${log.data?.length || 0})`);
+            continue;
+          }
+          
           try {
             // Decode manually: controller (topic[1]), owner (topic[2]), requestId (topic[3]), sender and shares in data
+            if (!log.topics[1] || !log.topics[2] || !log.topics[3]) {
+              throw new Error('Missing required topics');
+            }
+            
             const controller = '0x' + log.topics[1].slice(-40);
             const owner = '0x' + log.topics[2].slice(-40);
             const requestId = BigInt(log.topics[3]);
             
             // Decode data: sender (address, 32 bytes) + shares (uint256, 32 bytes)
+            // Data format: 0x + 24 bytes padding + 20 bytes address + 32 bytes shares = 66 + 64 = 130 chars
             const sender = '0x' + log.data.slice(26, 66); // Skip 0x and padding, get address
-            const shares = BigInt('0x' + log.data.slice(66, 130));
+            const sharesData = log.data.slice(66, 130);
+            if (!sharesData || sharesData.length !== 64) {
+              throw new Error(`Invalid shares data length: ${sharesData?.length || 0}`);
+            }
+            const shares = BigInt('0x' + sharesData);
             
             // Create a log-like object that matches our expected format
             const decodedLog = {
@@ -351,10 +374,17 @@ async function indexVaultEvents(fromBlock, toBlock) {
               },
             };
             redeemRequestedLogs.push(decodedLog);
-            console.log(`Decoded RedeemRequest from topic hash: tx=${log.transactionHash}, owner=${owner}, requestId=${requestId}, shares=${shares}`);
+            console.log(`✅ Decoded RedeemRequest from topic hash: tx=${log.transactionHash}, owner=${owner}, requestId=${requestId}, shares=${shares}`);
           } catch (decodeError) {
-            console.log(`Failed to decode log ${log.transactionHash}: ${decodeError.message}`);
-            console.log(`  Log data: ${log.data}, topics: ${log.topics.length}`);
+            console.log(`⚠️  Failed to decode log ${log.transactionHash}: ${decodeError.message}`);
+            console.log(`  Log structure: topics=${log.topics.length}, dataLength=${log.data?.length || 0}`);
+            if (log.topics.length >= 2) {
+              console.log(`  Topic[1] (controller): ${log.topics[1]}`);
+              console.log(`  Topic[2] (owner): ${log.topics[2]}`);
+            }
+            if (log.topics.length >= 4) {
+              console.log(`  Topic[3] (requestId): ${log.topics[3]}`);
+            }
           }
         }
         if (redeemRequestedLogs.length > 0) {
