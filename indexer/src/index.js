@@ -72,6 +72,15 @@ async function initDatabase() {
   colSnapshots = db.collection('snapshots');
   colMeta = db.collection('meta');
 
+  // Drop existing non-unique indexes if they exist, then create unique ones
+  try {
+    // Try to drop existing transaction_hash indexes (they might not be unique)
+    await colDeposits.dropIndex('transaction_hash_1').catch(() => {});
+    await colWithdrawals.dropIndex('transaction_hash_1').catch(() => {});
+  } catch (e) {
+    // Ignore errors if indexes don't exist
+  }
+
   await Promise.all([
     colIntents.createIndex({ intent_hash: 1 }, { unique: true }),
     colIntents.createIndex({ user_address: 1, created_at: -1 }),
@@ -294,56 +303,66 @@ async function indexVaultEvents(fromBlock, toBlock) {
       console.log(`Error querying ERC-7540 RedeemRequest: ${e.message}`);
     }
     
-    // Also try querying by topic hash directly as fallback
+    // ALWAYS try querying by topic hash as fallback (even if first query succeeded)
     // ERC-7540 RedeemRequest topic[0] = keccak256("RedeemRequest(address,address,uint256,address,uint256)")
     // This is 0x1fdc681a13d8c5da54e301c7ce6542dcde4581e4725043fdab2db12ddc574506
-    if (redeemRequestedLogs.length === 0) {
-      try {
-        const topicHash = '0x1fdc681a13d8c5da54e301c7ce6542dcde4581e4725043fdab2db12ddc574506';
-        const logsByTopic = await client.getLogs({
-          address: VAULT_ADDRESS,
-          topics: [topicHash],
-          fromBlock,
-          toBlock,
-        });
+    // This ensures we catch events even if the event signature parsing fails
+    try {
+      const topicHash = '0x1fdc681a13d8c5da54e301c7ce6542dcde4581e4725043fdab2db12ddc574506';
+      const logsByTopic = await client.getLogs({
+        address: VAULT_ADDRESS,
+        topics: [topicHash],
+        fromBlock,
+        toBlock,
+      });
+      
+      if (logsByTopic.length > 0) {
+        console.log(`Found ${logsByTopic.length} logs with RedeemRequest topic hash in blocks ${fromBlock}-${toBlock}, attempting to decode...`);
         
-        if (logsByTopic.length > 0) {
-          console.log(`Found ${logsByTopic.length} logs with RedeemRequest topic hash, attempting to decode...`);
-          // Try to decode these logs manually
-          for (const log of logsByTopic) {
-            try {
-              // Decode manually: controller (topic[1]), owner (topic[2]), requestId (topic[3]), sender and shares in data
-              const controller = '0x' + log.topics[1].slice(-40);
-              const owner = '0x' + log.topics[2].slice(-40);
-              const requestId = BigInt(log.topics[3]);
-              
-              // Decode data: sender (address, 32 bytes) + shares (uint256, 32 bytes)
-              const sender = '0x' + log.data.slice(26, 66); // Skip 0x and padding, get address
-              const shares = BigInt('0x' + log.data.slice(66, 130));
-              
-              // Create a log-like object that matches our expected format
-              const decodedLog = {
-                ...log,
-                args: {
-                  controller,
-                  owner,
-                  requestId,
-                  sender,
-                  shares,
-                },
-              };
-              redeemRequestedLogs.push(decodedLog);
-            } catch (decodeError) {
-              console.log(`Failed to decode log ${log.transactionHash}: ${decodeError.message}`);
-            }
+        // Get existing transaction hashes to avoid duplicates
+        const existingTxHashes = new Set(redeemRequestedLogs.map(l => l.transactionHash));
+        
+        // Try to decode these logs manually
+        for (const log of logsByTopic) {
+          // Skip if we already have this transaction from the first query
+          if (existingTxHashes.has(log.transactionHash)) {
+            continue;
           }
-          if (redeemRequestedLogs.length > 0) {
-            console.log(`Successfully decoded ${redeemRequestedLogs.length} RedeemRequest events from topic hash`);
+          
+          try {
+            // Decode manually: controller (topic[1]), owner (topic[2]), requestId (topic[3]), sender and shares in data
+            const controller = '0x' + log.topics[1].slice(-40);
+            const owner = '0x' + log.topics[2].slice(-40);
+            const requestId = BigInt(log.topics[3]);
+            
+            // Decode data: sender (address, 32 bytes) + shares (uint256, 32 bytes)
+            const sender = '0x' + log.data.slice(26, 66); // Skip 0x and padding, get address
+            const shares = BigInt('0x' + log.data.slice(66, 130));
+            
+            // Create a log-like object that matches our expected format
+            const decodedLog = {
+              ...log,
+              args: {
+                controller,
+                owner,
+                requestId,
+                sender,
+                shares,
+              },
+            };
+            redeemRequestedLogs.push(decodedLog);
+            console.log(`Decoded RedeemRequest from topic hash: tx=${log.transactionHash}, owner=${owner}, requestId=${requestId}, shares=${shares}`);
+          } catch (decodeError) {
+            console.log(`Failed to decode log ${log.transactionHash}: ${decodeError.message}`);
+            console.log(`  Log data: ${log.data}, topics: ${log.topics.length}`);
           }
         }
-      } catch (e) {
-        console.log(`Error querying by topic hash: ${e.message}`);
+        if (redeemRequestedLogs.length > 0) {
+          console.log(`Total RedeemRequest events after topic hash fallback: ${redeemRequestedLogs.length}`);
+        }
       }
+    } catch (e) {
+      console.log(`Error querying by topic hash: ${e.message}`);
     }
     
     let lagoonRedeemRequestedLogs = [];
@@ -393,8 +412,10 @@ async function indexVaultEvents(fromBlock, toBlock) {
     // Handle ERC-7540 RedeemRequest events
     for (const log of redeemRequestedLogs) {
       const { controller, owner, requestId, sender, shares } = log.args;
+      console.log(`Processing ERC-7540 RedeemRequest: tx=${log.transactionHash}, owner=${owner}, requestId=${requestId}, shares=${shares}, block=${log.blockNumber}`);
+      
       // Use owner as user, requestId as epoch_id
-      await colWithdrawals.updateOne(
+      const result = await colWithdrawals.updateOne(
         { transaction_hash: log.transactionHash },
         {
           $setOnInsert: {
@@ -411,6 +432,12 @@ async function indexVaultEvents(fromBlock, toBlock) {
         },
         { upsert: true }
       );
+      
+      if (result.upsertedCount > 0) {
+        console.log(`✅ Inserted new withdrawal: tx=${log.transactionHash}`);
+      } else if (result.matchedCount > 0) {
+        console.log(`ℹ️  Withdrawal already exists: tx=${log.transactionHash}`);
+      }
     }
 
     // Handle Lagoon-specific RedeemRequested events
