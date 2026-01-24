@@ -76,7 +76,8 @@ async function initDatabase() {
     colIntents.createIndex({ intent_hash: 1 }, { unique: true }),
     colIntents.createIndex({ user_address: 1, created_at: -1 }),
     colDeposits.createIndex({ user_address: 1, created_at: -1 }),
-    colDeposits.createIndex({ transaction_hash: 1 }),
+    colDeposits.createIndex({ transaction_hash: 1 }, { unique: true }),
+    colWithdrawals.createIndex({ transaction_hash: 1 }, { unique: true }),
     colWithdrawals.createIndex({ user_address: 1, created_at: -1 }),
     colSnapshots.createIndex({ date: 1, vault_address: 1 }, { unique: true }),
   ]);
