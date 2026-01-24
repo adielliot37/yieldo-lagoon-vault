@@ -276,15 +276,146 @@ async function indexVaultEvents(fromBlock, toBlock) {
       );
     }
 
-    const redeemRequestedLogs = await client.getLogs({
-      address: VAULT_ADDRESS,
-      event: parseAbiItem('event RedeemRequested(address indexed user, uint256 indexed epochId, uint256 shares)'),
-      fromBlock,
-      toBlock,
-    });
+    // Index RedeemRequested events
+    // Try ERC-7540 standard event first: RedeemRequest(address indexed controller, address indexed owner, uint256 indexed requestId, address sender, uint256 shares)
+    let redeemRequestedLogs = [];
+    try {
+      redeemRequestedLogs = await client.getLogs({
+        address: VAULT_ADDRESS,
+        event: parseAbiItem('event RedeemRequest(address indexed controller, address indexed owner, uint256 indexed requestId, address sender, uint256 shares)'),
+        fromBlock,
+        toBlock,
+      });
+      if (redeemRequestedLogs.length > 0) {
+        console.log(`Found ${redeemRequestedLogs.length} ERC-7540 RedeemRequest events in blocks ${fromBlock}-${toBlock}`);
+      }
+    } catch (e) {
+      console.log(`Error querying ERC-7540 RedeemRequest: ${e.message}`);
+    }
+    
+    // Also try querying by topic hash directly as fallback
+    // ERC-7540 RedeemRequest topic[0] = keccak256("RedeemRequest(address,address,uint256,address,uint256)")
+    // This is 0x1fdc681a13d8c5da54e301c7ce6542dcde4581e4725043fdab2db12ddc574506
+    if (redeemRequestedLogs.length === 0) {
+      try {
+        const topicHash = '0x1fdc681a13d8c5da54e301c7ce6542dcde4581e4725043fdab2db12ddc574506';
+        const logsByTopic = await client.getLogs({
+          address: VAULT_ADDRESS,
+          topics: [topicHash],
+          fromBlock,
+          toBlock,
+        });
+        
+        if (logsByTopic.length > 0) {
+          console.log(`Found ${logsByTopic.length} logs with RedeemRequest topic hash, attempting to decode...`);
+          // Try to decode these logs manually
+          for (const log of logsByTopic) {
+            try {
+              // Decode manually: controller (topic[1]), owner (topic[2]), requestId (topic[3]), sender and shares in data
+              const controller = '0x' + log.topics[1].slice(-40);
+              const owner = '0x' + log.topics[2].slice(-40);
+              const requestId = BigInt(log.topics[3]);
+              
+              // Decode data: sender (address, 32 bytes) + shares (uint256, 32 bytes)
+              const sender = '0x' + log.data.slice(26, 66); // Skip 0x and padding, get address
+              const shares = BigInt('0x' + log.data.slice(66, 130));
+              
+              // Create a log-like object that matches our expected format
+              const decodedLog = {
+                ...log,
+                args: {
+                  controller,
+                  owner,
+                  requestId,
+                  sender,
+                  shares,
+                },
+              };
+              redeemRequestedLogs.push(decodedLog);
+            } catch (decodeError) {
+              console.log(`Failed to decode log ${log.transactionHash}: ${decodeError.message}`);
+            }
+          }
+          if (redeemRequestedLogs.length > 0) {
+            console.log(`Successfully decoded ${redeemRequestedLogs.length} RedeemRequest events from topic hash`);
+          }
+        }
+      } catch (e) {
+        console.log(`Error querying by topic hash: ${e.message}`);
+      }
+    }
+    
+    let lagoonRedeemRequestedLogs = [];
+    try {
+      lagoonRedeemRequestedLogs = await client.getLogs({
+        address: VAULT_ADDRESS,
+        event: parseAbiItem('event RedeemRequested(address indexed user, uint256 indexed epochId, uint256 shares)'),
+        fromBlock,
+        toBlock,
+      });
+      if (lagoonRedeemRequestedLogs.length > 0) {
+        console.log(`Found ${lagoonRedeemRequestedLogs.length} Lagoon RedeemRequested events in blocks ${fromBlock}-${toBlock}`);
+      }
+    } catch (e) {
+      console.log(`Error querying Lagoon RedeemRequested: ${e.message}`);
+    }
 
+    // Also try to get ALL logs from vault and see if we're missing any redeem-related events
+    // This helps debug if the event signature is different
+    try {
+      const allVaultLogs = await client.getLogs({
+        address: VAULT_ADDRESS,
+        fromBlock,
+        toBlock,
+      });
+      
+      // Look for logs that might be redeem events by checking topic[0] (event signature)
+      // RedeemRequested topic[0] would be keccak256("RedeemRequested(address,uint256,uint256)")
+      // But we'll just log if we find logs we didn't catch
+      const caughtTxHashes = new Set([
+        ...redeemRequestedLogs.map(l => l.transactionHash),
+        ...lagoonRedeemRequestedLogs.map(l => l.transactionHash),
+      ]);
+      
+      const uncatchedLogs = allVaultLogs.filter(log => !caughtTxHashes.has(log.transactionHash));
+      if (uncatchedLogs.length > 0 && Math.random() < 0.1) { // Log 10% of the time to avoid spam
+        console.log(`Found ${uncatchedLogs.length} vault logs in blocks ${fromBlock}-${toBlock} that weren't caught by our event filters`);
+        // Log first few for debugging
+        uncatchedLogs.slice(0, 3).forEach(log => {
+          console.log(`  Uncaught log: tx=${log.transactionHash}, topics=${log.topics.length}, block=${log.blockNumber}`);
+        });
+      }
+    } catch (e) {
+      // Ignore errors in debug logging
+    }
+
+    // Handle ERC-7540 RedeemRequest events
     for (const log of redeemRequestedLogs) {
+      const { controller, owner, requestId, sender, shares } = log.args;
+      // Use owner as user, requestId as epoch_id
+      await colWithdrawals.updateOne(
+        { transaction_hash: log.transactionHash },
+        {
+          $setOnInsert: {
+            user_address: owner,
+            vault_address: VAULT_ADDRESS,
+            shares: shares.toString(),
+            assets: null,
+            epoch_id: Number(requestId),
+            status: 'pending',
+            block_number: log.blockNumber.toString(),
+            transaction_hash: log.transactionHash,
+            created_at: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+    }
+
+    // Handle Lagoon-specific RedeemRequested events
+    for (const log of lagoonRedeemRequestedLogs) {
       const { user, epochId, shares } = log.args;
+      console.log(`Found RedeemRequested event: user=${user}, epochId=${epochId}, shares=${shares}, tx=${log.transactionHash}`);
 
       await colWithdrawals.updateOne(
         { transaction_hash: log.transactionHash },
@@ -303,21 +434,61 @@ async function indexVaultEvents(fromBlock, toBlock) {
         },
         { upsert: true }
       );
+      console.log(`Saved withdrawal to database: tx=${log.transactionHash}`);
     }
 
-    const redeemSettledLogs = await client.getLogs({
-      address: VAULT_ADDRESS,
-      event: parseAbiItem('event RedeemSettled(address indexed user, uint256 indexed epochId, uint256 assets)'),
-      fromBlock,
-      toBlock,
-    });
+    // Log if no redeem events found (for debugging)
+    if (redeemRequestedLogs.length === 0 && lagoonRedeemRequestedLogs.length === 0) {
+      // Only log occasionally to avoid spam
+      if (Math.random() < 0.01) { // 1% chance
+        console.log(`No RedeemRequested events found in blocks ${fromBlock}-${toBlock}`);
+      }
+    }
 
+    // Index RedeemSettled events
+    // Try ERC-7540 standard event first: RedeemSettled(address indexed controller, address indexed owner, uint256 indexed requestId, address receiver, uint256 assets)
+    let redeemSettledLogs = [];
+    try {
+      redeemSettledLogs = await client.getLogs({
+        address: VAULT_ADDRESS,
+        event: parseAbiItem('event RedeemSettled(address indexed controller, address indexed owner, uint256 indexed requestId, address receiver, uint256 assets)'),
+        fromBlock,
+        toBlock,
+      });
+    } catch (e) {
+      console.log('ERC-7540 RedeemSettled event not found, trying Lagoon-specific format');
+    }
+    
+    let lagoonRedeemSettledLogs = [];
+    if (redeemSettledLogs.length === 0) {
+      try {
+        lagoonRedeemSettledLogs = await client.getLogs({
+          address: VAULT_ADDRESS,
+          event: parseAbiItem('event RedeemSettled(address indexed user, uint256 indexed epochId, uint256 assets)'),
+          fromBlock,
+          toBlock,
+        });
+      } catch (e) {
+        console.log('Lagoon RedeemSettled event not found, vault may use different event format');
+      }
+    }
+
+    // Handle ERC-7540 RedeemSettled events
     for (const log of redeemSettledLogs) {
+      const { controller, owner, requestId, receiver, assets } = log.args;
+      await colWithdrawals.updateOne(
+        { user_address: owner, vault_address: VAULT_ADDRESS, epoch_id: Number(requestId) },
+        { $set: { assets: assets.toString(), status: 'settled', settled_at: new Date() } }
+      );
+    }
+
+    // Handle Lagoon-specific RedeemSettled events
+    for (const log of lagoonRedeemSettledLogs) {
       const { user, epochId, assets } = log.args;
 
       await colWithdrawals.updateOne(
         { user_address: user, vault_address: VAULT_ADDRESS, epoch_id: Number(epochId) },
-        { $set: { assets: assets.toString(), status: 'settled' } }
+        { $set: { assets: assets.toString(), status: 'settled', settled_at: new Date() } }
       );
     }
 
@@ -578,8 +749,153 @@ app.get('/api/intents', async (req, res) => {
   }
 });
 
+app.get('/api/withdrawals', async (req, res) => {
+  try {
+    const { user } = req.query;
+    const filter = user ? { user_address: user } : {};
+    const docs = await colWithdrawals.find(filter).sort({ created_at: -1 }).limit(100).toArray();
+    res.json(
+      docs.map((w) => ({
+        id: w._id?.toString(),
+        user: w.user_address,
+        vault: w.vault_address,
+        shares: w.shares,
+        assets: w.assets,
+        epochId: w.epoch_id ?? null,
+        status: w.status,
+        timestamp: w.created_at?.toISOString?.() || new Date().toISOString(),
+        settledAt: w.settled_at?.toISOString?.() || null,
+        blockNumber: w.block_number ?? null,
+        txHash: w.transaction_hash ?? null,
+      }))
+    );
+  } catch (error) {
+    console.error('Error fetching withdrawals:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', lastBlock: lastProcessedBlock?.toString() });
+});
+
+// Debug endpoint to check what events were emitted in a transaction
+app.get('/api/debug/tx', async (req, res) => {
+  try {
+    const { txHash } = req.query;
+    
+    if (!txHash) {
+      return res.status(400).json({ error: 'txHash query parameter is required' });
+    }
+
+    // Get transaction receipt to see all events
+    const receipt = await client.getTransactionReceipt({ hash: txHash });
+    
+    if (!receipt) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+
+    // Get all logs from this transaction
+    const allLogs = receipt.logs || [];
+    
+    // Filter logs from the vault address
+    const vaultLogs = allLogs.filter(log => 
+      log.address.toLowerCase() === VAULT_ADDRESS?.toLowerCase()
+    );
+
+    // Try to decode known events
+    const decodedEvents = [];
+    for (const log of vaultLogs) {
+      try {
+        // Try to decode as RedeemRequested
+        try {
+          const decoded = parseAbiItem('event RedeemRequested(address indexed user, uint256 indexed epochId, uint256 shares)');
+          // This is simplified - in production you'd use proper decoding
+          decodedEvents.push({
+            address: log.address,
+            topics: log.topics,
+            data: log.data,
+            event: 'RedeemRequested (attempted)',
+            blockNumber: log.blockNumber.toString(),
+          });
+        } catch (e) {
+          decodedEvents.push({
+            address: log.address,
+            topics: log.topics,
+            data: log.data,
+            event: 'Unknown event',
+            blockNumber: log.blockNumber.toString(),
+          });
+        }
+      } catch (e) {
+        decodedEvents.push({
+          address: log.address,
+          topics: log.topics,
+          data: log.data,
+          event: 'Could not decode',
+          blockNumber: log.blockNumber.toString(),
+        });
+      }
+    }
+
+    res.json({
+      txHash,
+      blockNumber: receipt.blockNumber.toString(),
+      status: receipt.status,
+      from: receipt.from,
+      to: receipt.to,
+      vaultAddress: VAULT_ADDRESS,
+      totalLogs: allLogs.length,
+      vaultLogs: vaultLogs.length,
+      events: decodedEvents,
+      allLogs: allLogs.map(log => ({
+        address: log.address,
+        topics: log.topics,
+        data: log.data,
+      })),
+    });
+  } catch (error) {
+    console.error('Error in debug tx endpoint:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint to check all events from vault in a block range
+app.get('/api/debug/events', async (req, res) => {
+  try {
+    const { fromBlock, toBlock } = req.query;
+    
+    if (!fromBlock || !toBlock) {
+      return res.status(400).json({ error: 'fromBlock and toBlock query parameters are required' });
+    }
+
+    const from = BigInt(fromBlock);
+    const to = BigInt(toBlock);
+
+    // Get ALL logs from the vault (no event filter)
+    const allLogs = await client.getLogs({
+      address: VAULT_ADDRESS,
+      fromBlock: from,
+      toBlock: to,
+    });
+
+    res.json({
+      fromBlock: from.toString(),
+      toBlock: to.toString(),
+      vaultAddress: VAULT_ADDRESS,
+      totalEvents: allLogs.length,
+      events: allLogs.map(log => ({
+        blockNumber: log.blockNumber.toString(),
+        transactionHash: log.transactionHash,
+        address: log.address,
+        topics: log.topics,
+        data: log.data,
+      })),
+    });
+  } catch (error) {
+    console.error('Error in debug events endpoint:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Backfill endpoint to re-index specific block ranges
