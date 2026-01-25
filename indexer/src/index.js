@@ -639,19 +639,43 @@ async function createDailySnapshot() {
     const now = new Date();
     const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
     const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59));
-    const dateKey = startOfDay.toISOString().slice(0, 10); // YYYY-MM-DD
+    const dateKey = startOfDay.toISOString().slice(0, 10);
 
-    const depositsToday = await colDeposits
-      .find({ created_at: { $gte: startOfDay, $lte: endOfDay } }, { projection: { amount: 1 } })
+    const yieldoDepositsToday = await colDeposits
+      .find({ 
+        source: 'yieldo',
+        created_at: { $gte: startOfDay, $lte: endOfDay },
+        status: { $in: ['executed', 'settled'] }
+      })
       .toArray();
-    const totalDeposits = depositsToday.reduce((acc, d) => acc + BigInt(d.amount || '0'), 0n).toString();
+    
+    const totalDeposits = yieldoDepositsToday.reduce(
+      (acc, d) => acc + BigInt(d.amount || '0'), 
+      0n
+    ).toString();
 
-    const withdrawalsToday = await colWithdrawals
-      .find({ created_at: { $gte: startOfDay, $lte: endOfDay } }, { projection: { assets: 1 } })
+    const yieldoWithdrawalsToday = await colWithdrawals
+      .find({ 
+        source: 'yieldo',
+        created_at: { $gte: startOfDay, $lte: endOfDay },
+        status: { $in: ['pending', 'settled'] }
+      })
       .toArray();
-    const totalWithdrawals = withdrawalsToday
-      .reduce((acc, w) => acc + BigInt(w.assets || '0'), 0n)
-      .toString();
+    
+    let totalWithdrawals = 0n;
+    for (const w of yieldoWithdrawalsToday) {
+      if (w.assets) {
+        totalWithdrawals += BigInt(w.assets);
+      } else if (w.shares && vault.totalSupply > 0n) {
+        try {
+          const sharesBigInt = BigInt(w.shares);
+          const estimatedAssets = vault.convertToAssets(sharesBigInt);
+          totalWithdrawals += estimatedAssets;
+        } catch (error) {
+          console.error(`Error converting shares to assets for withdrawal ${w._id}:`, error);
+        }
+      }
+    }
 
     await colSnapshots.updateOne(
       { date: dateKey, vault_address: VAULT_ADDRESS },
@@ -662,7 +686,7 @@ async function createDailySnapshot() {
           total_assets: vault.totalAssets?.toString() || '0',
           total_supply: vault.totalSupply?.toString() || '0',
           total_deposits: totalDeposits,
-          total_withdrawals: totalWithdrawals,
+          total_withdrawals: totalWithdrawals.toString(),
           deposit_epoch_id: vault.depositEpochId || 0,
           redeem_epoch_id: vault.redeemEpochId || 0,
           created_at: new Date(),
@@ -671,7 +695,9 @@ async function createDailySnapshot() {
       { upsert: true }
     );
 
-    console.log(`Daily snapshot created for ${dateKey}`);
+    const depositsFormatted = (BigInt(totalDeposits) / BigInt(1e6)).toString();
+    const withdrawalsFormatted = (totalWithdrawals / BigInt(1e6)).toString();
+    console.log(`Daily snapshot created for ${dateKey} (Yieldo only): deposits=${depositsFormatted} USDC, withdrawals=${withdrawalsFormatted} USDC`);
   } catch (error) {
     console.error('Error creating daily snapshot:', error);
   }
@@ -803,12 +829,15 @@ app.get('/api/snapshots', async (req, res) => {
     res.json(
       docs.map((s) => ({
         date: s.date,
-        aum: s.total_assets,
-        totalDeposits: s.total_deposits,
-        totalWithdrawals: s.total_withdrawals,
-        totalSupply: s.total_supply,
-        depositEpochId: s.deposit_epoch_id,
-        redeemEpochId: s.redeem_epoch_id,
+        total_assets: s.total_assets || '0',
+        total_deposits: s.total_deposits || '0',
+        total_withdrawals: s.total_withdrawals || '0',
+        aum: s.total_assets || '0',
+        totalDeposits: s.total_deposits || '0',
+        totalWithdrawals: s.total_withdrawals || '0',
+        totalSupply: s.total_supply || '0',
+        depositEpochId: s.deposit_epoch_id || 0,
+        redeemEpochId: s.redeem_epoch_id || 0,
       }))
     );
   } catch (error) {

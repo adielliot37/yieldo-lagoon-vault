@@ -52,9 +52,12 @@ interface AUMData {
 
 interface Snapshot {
   date: string
-  aum: string
-  totalDeposits: string
-  totalWithdrawals: string
+  aum?: string
+  total_assets?: string
+  totalDeposits?: string
+  total_deposits?: string
+  totalWithdrawals?: string
+  total_withdrawals?: string
 }
 
 const formatUSDC = (amount: string | number | undefined | null): string => {
@@ -337,9 +340,9 @@ export default function Dashboard() {
           </div>
 
           <div className="border-2 border-black p-6">
-            <h2 className="text-2xl font-bold mb-4">Daily Snapshots</h2>
+            <h2 className="text-2xl font-bold mb-4">Daily Snapshots (Yieldo Protocol)</h2>
             <p className="text-sm text-gray-500 mb-4">
-              Snapshots capture daily vault state (AUM, deposits, withdrawals) for attribution tracking.
+              Daily totals of deposits and withdrawals made through the Yieldo protocol only. Values are in USDC (6 decimals).
             </p>
             {loading ? (
               <p className="text-gray-700">Loading...</p>
@@ -351,11 +354,11 @@ export default function Dashboard() {
                   <div key={idx} className="border border-gray-300 p-4">
                     <div className="flex justify-between items-start mb-2">
                       <span className="font-semibold">{snapshot.date}</span>
-                      <span className="text-sm">{snapshot.aum} USDC</span>
+                      <span className="text-lg font-bold">{formatUSDC(snapshot.total_assets || snapshot.aum)} USDC</span>
                     </div>
                     <div className="text-sm text-gray-600 space-y-1">
-                      <p>Deposits: {snapshot.totalDeposits} USDC</p>
-                      <p>Withdrawals: {snapshot.totalWithdrawals} USDC</p>
+                      <p>Deposits: {formatUSDC(snapshot.total_deposits || snapshot.totalDeposits || '0')} USDC</p>
+                      <p>Withdrawals: {formatUSDC(snapshot.total_withdrawals || snapshot.totalWithdrawals || '0')} USDC</p>
                     </div>
                   </div>
                 ))}
