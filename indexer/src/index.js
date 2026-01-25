@@ -48,6 +48,7 @@ let colDeposits;
 let colWithdrawals;
 let colSnapshots;
 let colMeta;
+let colPendingYieldoWithdrawals; // Track withdrawals initiated from Yieldo frontend
 
 const client = createPublicClient({
   chain: avalanche,
@@ -71,25 +72,27 @@ async function initDatabase() {
   colWithdrawals = db.collection('withdrawals');
   colSnapshots = db.collection('snapshots');
   colMeta = db.collection('meta');
+  colPendingYieldoWithdrawals = db.collection('pending_yieldo_withdrawals');
 
-  // Drop existing non-unique indexes if they exist, then create unique ones
   try {
-    // Try to drop existing transaction_hash indexes (they might not be unique)
     await colDeposits.dropIndex('transaction_hash_1').catch(() => {});
     await colWithdrawals.dropIndex('transaction_hash_1').catch(() => {});
   } catch (e) {
     // Ignore errors if indexes don't exist
   }
 
-  await Promise.all([
-    colIntents.createIndex({ intent_hash: 1 }, { unique: true }),
-    colIntents.createIndex({ user_address: 1, created_at: -1 }),
-    colDeposits.createIndex({ user_address: 1, created_at: -1 }),
-    colDeposits.createIndex({ transaction_hash: 1 }, { unique: true }),
-    colWithdrawals.createIndex({ transaction_hash: 1 }, { unique: true }),
-    colWithdrawals.createIndex({ user_address: 1, created_at: -1 }),
-    colSnapshots.createIndex({ date: 1, vault_address: 1 }, { unique: true }),
-  ]);
+    await Promise.all([
+      colIntents.createIndex({ intent_hash: 1 }, { unique: true }),
+      colIntents.createIndex({ user_address: 1, created_at: -1 }),
+      colDeposits.createIndex({ user_address: 1, created_at: -1 }),
+      colDeposits.createIndex({ transaction_hash: 1 }, { unique: true }),
+      colWithdrawals.createIndex({ transaction_hash: 1 }, { unique: true }),
+      colWithdrawals.createIndex({ user_address: 1, created_at: -1 }),
+      colSnapshots.createIndex({ date: 1, vault_address: 1 }, { unique: true }),
+      colPendingYieldoWithdrawals.createIndex({ user_address: 1, created_at: -1 }),
+      colPendingYieldoWithdrawals.createIndex({ transaction_hash: 1 }, { unique: true }),
+      colPendingYieldoWithdrawals.createIndex({ created_at: 1 }, { expireAfterSeconds: 3600 }),
+    ]);
 
   console.log('MongoDB initialized');
 }
@@ -98,7 +101,6 @@ async function indexDepositRouterEvents(fromBlock, toBlock) {
   if (!DEPOSIT_ROUTER_ADDRESS) return;
 
   try {
-    // Ensure we don't query blocks that haven't been finalized
     if (fromBlock > toBlock) {
       console.warn(`Invalid block range: fromBlock ${fromBlock} > toBlock ${toBlock}`);
       return;
@@ -160,6 +162,7 @@ async function indexDepositRouterEvents(fromBlock, toBlock) {
             block_number: log.blockNumber.toString(),
             transaction_hash: log.transactionHash,
             executed_at: new Date(),
+            source: 'yieldo',
           },
           $setOnInsert: {
             shares: null,
@@ -201,14 +204,13 @@ async function indexDepositRouterEvents(fromBlock, toBlock) {
       );
     }
   } catch (error) {
-    // Handle "block not accepted" errors - throw so main loop can handle it
     if (error.message && (error.message.includes('after last accepted block') || error.message.includes('requested from block'))) {
       const finalityError = new Error(`Block range ${fromBlock}-${toBlock} not yet finalized`);
       finalityError.name = 'BlockNotFinalizedError';
       throw finalityError;
     }
     console.error('Error indexing DepositRouter events:', error);
-    throw error; // Re-throw other errors
+    throw error;
   }
 }
 
@@ -216,14 +218,10 @@ async function indexVaultEvents(fromBlock, toBlock) {
   if (!VAULT_ADDRESS) return;
 
   try {
-    // Ensure we don't query blocks that haven't been finalized
     if (fromBlock > toBlock) {
       console.warn(`Invalid block range: fromBlock ${fromBlock} > toBlock ${toBlock}`);
       return;
     }
-
-    // Index DepositRequested events
-    // Try ERC-7540 standard event first: DepositRequest(address indexed controller, address indexed owner, uint256 indexed requestId, address sender, uint256 assets)
     let depositRequestedLogs = [];
     try {
       depositRequestedLogs = await client.getLogs({
@@ -252,20 +250,54 @@ async function indexVaultEvents(fromBlock, toBlock) {
 
     for (const log of depositRequestedLogs) {
       const { controller, owner, requestId, sender, assets } = log.args;
-      // Use owner as user, requestId as epoch_id (or map to epoch if needed)
+      const existingDeposit = await colDeposits.findOne(
+        { user_address: owner, vault_address: VAULT_ADDRESS, status: 'pending' },
+        { sort: { created_at: -1 } }
+      );
+      let source = 'lagoon';
+      if (existingDeposit) {
+        if (existingDeposit.source === 'yieldo' || existingDeposit.intent_hash) {
+          source = 'yieldo';
+        }
+      }
+      
       await colDeposits.updateOne(
         { user_address: owner, vault_address: VAULT_ADDRESS, status: 'pending' },
-        { $set: { epoch_id: Number(requestId), status: 'requested', requested_amount: assets.toString() } },
+        { 
+          $set: { 
+            epoch_id: Number(requestId), 
+            status: 'requested', 
+            requested_amount: assets.toString(),
+            source: source
+          } 
+        },
         { sort: { created_at: -1 } }
       );
     }
     
-    // Handle Lagoon-specific DepositRequested events (if different format)
     for (const log of lagoonDepositRequestedLogs) {
       const { user, epochId, amount } = log.args;
+      const existingDeposit = await colDeposits.findOne(
+        { user_address: user, vault_address: VAULT_ADDRESS, status: 'pending' },
+        { sort: { created_at: -1 } }
+      );
+      let source = 'lagoon';
+      if (existingDeposit) {
+        if (existingDeposit.source === 'yieldo' || existingDeposit.intent_hash) {
+          source = 'yieldo';
+        }
+      }
+      
       await colDeposits.updateOne(
         { user_address: user, vault_address: VAULT_ADDRESS, status: 'pending' },
-        { $set: { epoch_id: Number(epochId), status: 'requested', requested_amount: amount.toString() } },
+        { 
+          $set: { 
+            epoch_id: Number(epochId), 
+            status: 'requested', 
+            requested_amount: amount.toString(),
+            source: source
+          } 
+        },
         { sort: { created_at: -1 } }
       );
     }
@@ -410,8 +442,6 @@ async function indexVaultEvents(fromBlock, toBlock) {
       console.log(`Error querying Lagoon RedeemRequested: ${e.message}`);
     }
 
-    // Also try to get ALL logs from vault and see if we're missing any redeem-related events
-    // This helps debug if the event signature is different
     try {
       const allVaultLogs = await client.getLogs({
         address: VAULT_ADDRESS,
@@ -419,18 +449,14 @@ async function indexVaultEvents(fromBlock, toBlock) {
         toBlock,
       });
       
-      // Look for logs that might be redeem events by checking topic[0] (event signature)
-      // RedeemRequested topic[0] would be keccak256("RedeemRequested(address,uint256,uint256)")
-      // But we'll just log if we find logs we didn't catch
       const caughtTxHashes = new Set([
         ...redeemRequestedLogs.map(l => l.transactionHash),
         ...lagoonRedeemRequestedLogs.map(l => l.transactionHash),
       ]);
       
       const uncatchedLogs = allVaultLogs.filter(log => !caughtTxHashes.has(log.transactionHash));
-      if (uncatchedLogs.length > 0 && Math.random() < 0.1) { // Log 10% of the time to avoid spam
+      if (uncatchedLogs.length > 0 && Math.random() < 0.1) {
         console.log(`Found ${uncatchedLogs.length} vault logs in blocks ${fromBlock}-${toBlock} that weren't caught by our event filters`);
-        // Log first few for debugging
         uncatchedLogs.slice(0, 3).forEach(log => {
           console.log(`  Uncaught log: tx=${log.transactionHash}, topics=${log.topics.length}, block=${log.blockNumber}`);
         });
@@ -439,12 +465,16 @@ async function indexVaultEvents(fromBlock, toBlock) {
       // Ignore errors in debug logging
     }
 
-    // Handle ERC-7540 RedeemRequest events
     for (const log of redeemRequestedLogs) {
       const { controller, owner, requestId, sender, shares } = log.args;
       console.log(`Processing ERC-7540 RedeemRequest: tx=${log.transactionHash}, owner=${owner}, requestId=${requestId}, shares=${shares}, block=${log.blockNumber}`);
       
-      // Use owner as user, requestId as epoch_id
+      const pendingMarker = await colPendingYieldoWithdrawals.findOne({
+        transaction_hash: log.transactionHash
+      });
+      
+      const source = pendingMarker ? 'yieldo' : 'lagoon';
+      
       const result = await colWithdrawals.updateOne(
         { transaction_hash: log.transactionHash },
         {
@@ -457,6 +487,7 @@ async function indexVaultEvents(fromBlock, toBlock) {
             status: 'pending',
             block_number: log.blockNumber.toString(),
             transaction_hash: log.transactionHash,
+            source: source,
             created_at: new Date(),
           },
         },
@@ -464,18 +495,34 @@ async function indexVaultEvents(fromBlock, toBlock) {
       );
       
       if (result.upsertedCount > 0) {
-        console.log(`✅ Inserted new withdrawal: tx=${log.transactionHash}`);
+        console.log(`✅ Inserted new withdrawal: tx=${log.transactionHash}, source=${source}`);
+        if (pendingMarker) {
+          await colPendingYieldoWithdrawals.deleteOne({ transaction_hash: log.transactionHash });
+        }
       } else if (result.matchedCount > 0) {
+        if (pendingMarker) {
+          await colWithdrawals.updateOne(
+            { transaction_hash: log.transactionHash },
+            { $set: { source: 'yieldo' } }
+          );
+          await colPendingYieldoWithdrawals.deleteOne({ transaction_hash: log.transactionHash });
+          console.log(`✅ Updated withdrawal source to Yieldo: tx=${log.transactionHash}`);
+        }
         console.log(`ℹ️  Withdrawal already exists: tx=${log.transactionHash}`);
       }
     }
 
-    // Handle Lagoon-specific RedeemRequested events
     for (const log of lagoonRedeemRequestedLogs) {
       const { user, epochId, shares } = log.args;
       console.log(`Found RedeemRequested event: user=${user}, epochId=${epochId}, shares=${shares}, tx=${log.transactionHash}`);
 
-      await colWithdrawals.updateOne(
+      const pendingMarker = await colPendingYieldoWithdrawals.findOne({
+        transaction_hash: log.transactionHash
+      });
+      
+      const source = pendingMarker ? 'yieldo' : 'lagoon';
+
+      const result = await colWithdrawals.updateOne(
         { transaction_hash: log.transactionHash },
         {
           $setOnInsert: {
@@ -487,24 +534,35 @@ async function indexVaultEvents(fromBlock, toBlock) {
             status: 'pending',
             block_number: log.blockNumber.toString(),
             transaction_hash: log.transactionHash,
+            source: source,
             created_at: new Date(),
           },
         },
         { upsert: true }
       );
-      console.log(`Saved withdrawal to database: tx=${log.transactionHash}`);
-    }
-
-    // Log if no redeem events found (for debugging)
-    if (redeemRequestedLogs.length === 0 && lagoonRedeemRequestedLogs.length === 0) {
-      // Only log occasionally to avoid spam
-      if (Math.random() < 0.01) { // 1% chance
-        console.log(`No RedeemRequested events found in blocks ${fromBlock}-${toBlock}`);
+      
+      if (result.upsertedCount > 0) {
+        console.log(`Saved withdrawal to database: tx=${log.transactionHash}, source=${source}`);
+        if (pendingMarker) {
+          await colPendingYieldoWithdrawals.deleteOne({ transaction_hash: log.transactionHash });
+        }
+      } else if (result.matchedCount > 0) {
+        if (pendingMarker) {
+          await colWithdrawals.updateOne(
+            { transaction_hash: log.transactionHash },
+            { $set: { source: 'yieldo' } }
+          );
+          await colPendingYieldoWithdrawals.deleteOne({ transaction_hash: log.transactionHash });
+          console.log(`✅ Updated withdrawal source to Yieldo: tx=${log.transactionHash}`);
+        }
       }
     }
 
-    // Index RedeemSettled events
-    // Try ERC-7540 standard event first: RedeemSettled(address indexed controller, address indexed owner, uint256 indexed requestId, address receiver, uint256 assets)
+    if (redeemRequestedLogs.length === 0 && lagoonRedeemRequestedLogs.length === 0) {
+      if (Math.random() < 0.01) {
+        console.log(`No RedeemRequested events found in blocks ${fromBlock}-${toBlock}`);
+      }
+    }
     let redeemSettledLogs = [];
     try {
       redeemSettledLogs = await client.getLogs({
@@ -531,7 +589,6 @@ async function indexVaultEvents(fromBlock, toBlock) {
       }
     }
 
-    // Handle ERC-7540 RedeemSettled events
     for (const log of redeemSettledLogs) {
       const { controller, owner, requestId, receiver, assets } = log.args;
       await colWithdrawals.updateOne(
@@ -540,7 +597,6 @@ async function indexVaultEvents(fromBlock, toBlock) {
       );
     }
 
-    // Handle Lagoon-specific RedeemSettled events
     for (const log of lagoonRedeemSettledLogs) {
       const { user, epochId, assets } = log.args;
 
@@ -585,7 +641,6 @@ async function createDailySnapshot() {
     const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59));
     const dateKey = startOfDay.toISOString().slice(0, 10); // YYYY-MM-DD
 
-    // Calculate total deposits and withdrawals for today (BigInt sums on base-unit strings)
     const depositsToday = await colDeposits
       .find({ created_at: { $gte: startOfDay, $lte: endOfDay } }, { projection: { amount: 1 } })
       .toArray();
@@ -622,13 +677,11 @@ async function createDailySnapshot() {
   }
 }
 
-// Main indexing loop
 let lastProcessedBlock = null;
 
 async function startIndexing() {
   await initDatabase();
 
-  // Restore last processed block from MongoDB meta (or start from 1000 blocks ago)
   const meta = await colMeta.findOne({ _id: 'lastProcessedBlock' });
   if (meta?.value) {
     lastProcessedBlock = BigInt(meta.value);
@@ -638,20 +691,13 @@ async function startIndexing() {
 
   console.log(`Starting indexing from block ${lastProcessedBlock}`);
 
-  // Helper function to get a safe block number that's definitely finalized
-  // Avalanche requires blocks to be "accepted" before logs can be queried
-  // Based on network conditions, this can take 20-100+ blocks
-  // We use a configurable but conservative default margin
   async function getSafeBlockNumber() {
     const latestBlock = await client.getBlockNumber();
-    // Use a large safety margin - can be configured via env var, default 60 blocks
-    // This ensures we only query blocks that are definitely finalized
     const SAFETY_MARGIN = BigInt(process.env.AVALANCHE_SAFETY_MARGIN || '60');
     const safeBlock = latestBlock > SAFETY_MARGIN ? latestBlock - SAFETY_MARGIN : latestBlock;
     return safeBlock;
   }
 
-  // Function to backfill a specific block range (for missed blocks)
   async function backfillBlockRange(fromBlock, toBlock) {
     try {
       console.log(`Backfilling blocks ${fromBlock} to ${toBlock}`);
@@ -665,7 +711,6 @@ async function startIndexing() {
     }
   }
 
-  // Index every 10 seconds
   setInterval(async () => {
     try {
       const latestBlock = await client.getBlockNumber();
@@ -676,12 +721,10 @@ async function startIndexing() {
       if (fromBlock <= toBlock) {
         console.log(`Indexing blocks ${fromBlock} to ${toBlock} (latest: ${latestBlock}, safe: ${safeBlock})`);
         
-        // Try indexing, but only update lastProcessedBlock if successful
         try {
           await indexDepositRouterEvents(fromBlock, toBlock);
           await indexVaultEvents(fromBlock, toBlock);
           
-          // Only update lastProcessedBlock if indexing was successful
           lastProcessedBlock = toBlock;
           await colMeta.updateOne(
             { _id: 'lastProcessedBlock' },
@@ -689,37 +732,28 @@ async function startIndexing() {
             { upsert: true }
           );
         } catch (indexError) {
-          // If indexing fails due to block finality, don't update lastProcessedBlock
           if (indexError.name === 'BlockNotFinalizedError' || 
               (indexError.message && (
                 indexError.message.includes('after last accepted block') || 
                 indexError.message.includes('requested from block') ||
                 indexError.message.includes('not yet finalized')
               ))) {
-            // Silently skip - blocks will be indexed in next iteration
-            return; // Exit early, don't update lastProcessedBlock
+            return;
           }
-          throw indexError; // Re-throw if it's a different error
+          throw indexError;
         }
       }
 
-      // Periodically check for gaps and backfill them (every 5 minutes)
-      // This helps catch any blocks that were missed due to errors or finality issues
       const now = Date.now();
       const lastGapCheck = await colMeta.findOne({ _id: 'lastGapCheck' });
-      const GAP_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
+      const GAP_CHECK_INTERVAL = 5 * 60 * 1000;
 
       if (!lastGapCheck || (now - lastGapCheck.value) > GAP_CHECK_INTERVAL) {
-        // Check for gaps in the last 1000 blocks
         const checkFromBlock = lastProcessedBlock > 1000n ? lastProcessedBlock - 1000n : 0n;
         const checkToBlock = lastProcessedBlock;
         
-        // This is a simple check - in production you might want more sophisticated gap detection
-        // For now, we'll just try to backfill any blocks that are significantly behind
         if (checkFromBlock < lastProcessedBlock) {
           console.log(`Checking for gaps between blocks ${checkFromBlock} and ${checkToBlock}`);
-          // Note: Actual gap detection would require checking which blocks have events
-          // For now, this is a placeholder - you can enhance it later
         }
 
         await colMeta.updateOne(
@@ -731,7 +765,7 @@ async function startIndexing() {
     } catch (error) {
       console.error('Error in indexing loop:', error);
     }
-  }, 10000); // Every 10 seconds
+  }, 10000);
 
   cron.schedule('0 0 * * *', createDailySnapshot);
   console.log('Daily snapshot scheduler started');
@@ -750,6 +784,7 @@ app.get('/api/deposits', async (req, res) => {
         vault: d.vault_address,
         amount: d.amount,
         status: d.status,
+        source: d.source || 'yieldo',
         timestamp: d.created_at?.toISOString?.() || new Date().toISOString(),
         epochId: d.epoch_id ?? null,
         shares: d.shares ?? null,
@@ -821,6 +856,7 @@ app.get('/api/withdrawals', async (req, res) => {
         assets: w.assets,
         epochId: w.epoch_id ?? null,
         status: w.status,
+        source: w.source || 'lagoon',
         timestamp: w.created_at?.toISOString?.() || new Date().toISOString(),
         settledAt: w.settled_at?.toISOString?.() || null,
         blockNumber: w.block_number ?? null,
@@ -829,6 +865,218 @@ app.get('/api/withdrawals', async (req, res) => {
     );
   } catch (error) {
     console.error('Error fetching withdrawals:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/withdrawals/mark-yieldo', async (req, res) => {
+  try {
+    const { txHash, userAddress } = req.body;
+    
+    if (!txHash) {
+      return res.status(400).json({ error: 'txHash is required' });
+    }
+
+    console.log(`Marking withdrawal as Yieldo: ${txHash}`);
+
+    const result = await colWithdrawals.updateOne(
+      { transaction_hash: txHash },
+      { $set: { source: 'yieldo' } }
+    );
+
+    if (result.matchedCount > 0) {
+      await colPendingYieldoWithdrawals.deleteOne({ transaction_hash: txHash });
+      console.log(`✅ Marked withdrawal as Yieldo: ${txHash}`);
+      return res.json({ 
+        success: true, 
+        message: 'Withdrawal marked as from Yieldo',
+        txHash,
+        matchedCount: result.matchedCount,
+        modifiedCount: result.modifiedCount
+      });
+    }
+
+    if (userAddress) {
+      await colPendingYieldoWithdrawals.updateOne(
+        { transaction_hash: txHash },
+        {
+          $setOnInsert: {
+            transaction_hash: txHash,
+            user_address: userAddress,
+            created_at: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+      console.log(`📝 Stored pending marker for withdrawal: ${txHash} (will be marked when indexed)`);
+      return res.json({ 
+        success: true, 
+        message: 'Withdrawal not indexed yet, but marker stored. It will be marked as Yieldo when indexed.',
+        txHash,
+        pending: true
+      });
+    }
+    
+    console.log(`⚠️  Withdrawal not found for txHash: ${txHash}`);
+    return res.status(404).json({ 
+      error: 'Withdrawal not found. It may not have been indexed yet. Please wait a few seconds and try again.',
+      txHash 
+    });
+  } catch (error) {
+    console.error('Error marking withdrawal:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/aum', async (req, res) => {
+  try {
+    const { user } = req.query;
+    if (!user) {
+      return res.status(400).json({ error: 'user query parameter is required' });
+    }
+
+    const yieldoDeposits = await colDeposits
+      .find(        { 
+        user_address: user, 
+        $or: [
+          { source: 'yieldo' },
+          { intent_hash: { $exists: true, $ne: null } }
+        ],
+        status: { $in: ['executed', 'settled', 'requested'] } 
+      })
+      .toArray();
+    
+    const totalDepositsYieldo = yieldoDeposits.reduce(
+      (acc, d) => acc + BigInt(d.amount || '0'),
+      0n
+    ).toString();
+
+    // Get vault to convert shares to assets for pending withdrawals
+    let vault = null;
+    try {
+      if (VAULT_ADDRESS) {
+        vault = await Vault.fetch(VAULT_ADDRESS, client);
+      }
+    } catch (error) {
+      console.error('Error fetching vault for withdrawal calculation:', error);
+    }
+    
+    // Get all withdrawals from Yieldo for this user
+    const yieldoWithdrawals = await colWithdrawals
+      .find({ user_address: user, source: 'yieldo', status: { $in: ['pending', 'settled'] } })
+      .toArray();
+    
+    const totalWithdrawalsYieldo = yieldoWithdrawals.reduce(
+      (acc, w) => {
+        if (w.assets) {
+          return acc + BigInt(w.assets);
+        }
+        if (w.shares && vault && vault.totalSupply > 0n) {
+          try {
+            const sharesBigInt = BigInt(w.shares);
+            const estimatedAssets = vault.convertToAssets(sharesBigInt);
+            return acc + estimatedAssets;
+          } catch (error) {
+            console.error(`Error converting shares to assets for withdrawal ${w._id}:`, error);
+            return acc;
+          }
+        }
+        return acc;
+      },
+      0n
+    ).toString();
+
+    const lagoonWithdrawals = await colWithdrawals
+      .find({ user_address: user, source: 'lagoon', status: { $in: ['pending', 'settled'] } })
+      .toArray();
+    
+    const totalWithdrawalsLagoon = lagoonWithdrawals.reduce(
+      (acc, w) => {
+        if (w.assets) {
+          return acc + BigInt(w.assets);
+        }
+        if (w.shares && vault && vault.totalSupply > 0n) {
+          try {
+            const sharesBigInt = BigInt(w.shares);
+            const estimatedAssets = vault.convertToAssets(sharesBigInt);
+            return acc + estimatedAssets;
+          } catch (error) {
+            console.error(`Error converting shares to assets for withdrawal ${w._id}:`, error);
+            return acc;
+          }
+        }
+        return acc;
+      },
+      0n
+    ).toString();
+
+    const aumFromYieldo = (BigInt(totalDepositsYieldo) - BigInt(totalWithdrawalsYieldo)).toString();
+
+    let currentVaultBalance = '0';
+    try {
+      if (VAULT_ADDRESS) {
+        const vault = await Vault.fetch(VAULT_ADDRESS, client);
+        if (vault) {
+          const erc4626Abi = [
+            {
+              inputs: [{ name: 'account', type: 'address' }],
+              name: 'balanceOf',
+              outputs: [{ name: '', type: 'uint256' }],
+              stateMutability: 'view',
+              type: 'function',
+            },
+          ];
+          const userShares = await client.readContract({
+            address: VAULT_ADDRESS,
+            abi: erc4626Abi,
+            functionName: 'balanceOf',
+            args: [user],
+          });
+          
+          if (vault.totalSupply > 0n && userShares > 0n) {
+            currentVaultBalance = vault.convertToAssets(userShares).toString();
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching vault balance:', error);
+    }
+
+    const vaultBalanceBigInt = BigInt(currentVaultBalance);
+    const depositsBigInt = BigInt(totalDepositsYieldo);
+    const withdrawalsBigInt = BigInt(totalWithdrawalsYieldo);
+    
+    const theoreticalAUM = depositsBigInt - withdrawalsBigInt;
+    
+    const actualAUM = theoreticalAUM > vaultBalanceBigInt 
+      ? vaultBalanceBigInt.toString() 
+      : theoreticalAUM.toString();
+    
+    let hasDirectWithdrawals = false;
+    let directWithdrawalAmount = '0';
+    
+    if (vaultBalanceBigInt < theoreticalAUM) {
+      hasDirectWithdrawals = true;
+      directWithdrawalAmount = (theoreticalAUM - vaultBalanceBigInt).toString();
+    }
+
+    res.json({
+      user,
+      totalDepositsYieldo,
+      totalWithdrawalsYieldo,
+      totalWithdrawalsLagoon,
+      aumFromYieldo: actualAUM,
+      currentVaultBalance,
+      hasDirectWithdrawals,
+      directWithdrawalAmount,
+      breakdown: {
+        deposits: yieldoDeposits.length,
+        withdrawalsYieldo: yieldoWithdrawals.length,
+        withdrawalsLagoon: lagoonWithdrawals.length,
+      },
+    });
+  } catch (error) {
+    console.error('Error calculating AUM:', error);
     res.status(500).json({ error: error.message });
   }
 });

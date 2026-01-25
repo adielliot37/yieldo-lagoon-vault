@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS deposits (
     status VARCHAR(20) DEFAULT 'pending',
     block_number BIGINT,
     transaction_hash VARCHAR(66),
+    source VARCHAR(20) DEFAULT 'yieldo', -- 'yieldo' or 'lagoon' (direct deposit)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -43,7 +44,9 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     status VARCHAR(20) DEFAULT 'pending',
     block_number BIGINT,
     transaction_hash VARCHAR(66),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    source VARCHAR(20) DEFAULT 'lagoon', -- 'yieldo' or 'lagoon' (direct withdrawal)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    settled_at TIMESTAMP
 );
 
 -- Daily snapshots table
@@ -65,10 +68,13 @@ CREATE INDEX IF NOT EXISTS idx_deposit_intents_user ON deposit_intents(user_addr
 CREATE INDEX IF NOT EXISTS idx_deposit_intents_status ON deposit_intents(status);
 CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_address);
 CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status);
+CREATE INDEX IF NOT EXISTS idx_deposits_source ON deposits(source);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_user ON withdrawals(user_address);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_source ON withdrawals(source);
 CREATE INDEX IF NOT EXISTS idx_snapshots_date ON snapshots(date);
 CREATE INDEX IF NOT EXISTS idx_snapshots_vault ON snapshots(vault_address);
+
 
 
 

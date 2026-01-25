@@ -35,6 +35,12 @@ export default function KOLPage() {
   const [executedHash, setExecutedHash] = useState<`0x${string}` | null>(null)
   const [depositSuccess, setDepositSuccess] = useState(false)
   const [depositHash, setDepositHash] = useState<`0x${string}` | null>(null)
+  const [withdrawAmount, setWithdrawAmount] = useState('')
+  const [vaultShares, setVaultShares] = useState<bigint>(BigInt(0))
+  const [withdrawLoading, setWithdrawLoading] = useState(false)
+  const [withdrawHash, setWithdrawHash] = useState<`0x${string}` | null>(null)
+  const [withdrawSuccess, setWithdrawSuccess] = useState(false)
+  const [currentWithdrawTxType, setCurrentWithdrawTxType] = useState<'withdraw' | null>(null)
   const publicClient = usePublicClient()
 
   const { writeContract, data: hash, isPending, reset: resetWriteContract, error: writeError } = useWriteContract()
@@ -157,8 +163,28 @@ export default function KOLPage() {
   useEffect(() => {
     if (VAULT_ADDRESS && isConnected) {
       fetchVaultState()
+      fetchVaultShares()
     }
-  }, [VAULT_ADDRESS, isConnected])
+  }, [VAULT_ADDRESS, isConnected, address])
+
+  const fetchVaultShares = async () => {
+    if (!address || !VAULT_ADDRESS) return
+    
+    try {
+      const balance = await publicClient?.readContract({
+        address: VAULT_ADDRESS as Address,
+        abi: ERC20_ABI,
+        functionName: 'balanceOf',
+        args: [address],
+      }) as bigint
+      
+      if (balance !== undefined) {
+        setVaultShares(balance)
+      }
+    } catch (error) {
+      console.error('Failed to fetch vault shares:', error)
+    }
+  }
 
   const fetchVaultState = async () => {
     if (!VAULT_ADDRESS) {
@@ -237,9 +263,6 @@ export default function KOLPage() {
 
       const signature = await signDepositIntent(intent, chainId, DEPOSIT_ROUTER_ADDRESS as Address)
 
-      console.log('Depositing to contract:', DEPOSIT_ROUTER_ADDRESS)
-      console.log('Intent:', intent)
-      console.log('Signature:', signature)
       writeContract({
         address: DEPOSIT_ROUTER_ADDRESS as Address,
         abi: DEPOSIT_ROUTER_ABI,
@@ -365,7 +388,6 @@ export default function KOLPage() {
 
   useEffect(() => {
     if (writeError && currentTxType === 'execute') {
-      console.log('Write error detected:', writeError)
       setLoading(false)
       setCurrentTxType(null)
       let errorMessage = 'Execute deposit failed: '
@@ -429,6 +451,164 @@ export default function KOLPage() {
     }
   }, [isSuccess, currentTxType, hash, pendingIntentHash])
 
+  useEffect(() => {
+    if (isSuccess && currentWithdrawTxType === 'withdraw' && hash) {
+      setWithdrawLoading(false)
+      setCurrentWithdrawTxType(null)
+      setWithdrawSuccess(true)
+      setWithdrawHash(hash)
+      
+      const apiUrl = (process.env.NEXT_PUBLIC_INDEXER_API_URL || 'http://localhost:3001').replace(/\/$/, '')
+      
+      fetch(`${apiUrl}/api/withdrawals/mark-yieldo`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          txHash: hash,
+          userAddress: address
+        }),
+      })
+      .then(async (response) => {
+        const data = await response.json().catch(() => ({}))
+        if (response.ok) {
+          if (data.pending) {
+            console.log('✅ Pending marker stored - withdrawal will be marked when indexed')
+          } else {
+            console.log('✅ Withdrawal marked as from Yieldo')
+          }
+        } else {
+          console.error('Failed to mark withdrawal:', data)
+        }
+      })
+      .catch(err => console.error('Failed to mark withdrawal:', err))
+      
+      setTimeout(() => {
+        fetchVaultShares()
+        fetchVaultState()
+      }, 2000)
+      
+      setTimeout(() => {
+        setWithdrawSuccess(false)
+        setWithdrawHash(null)
+      }, 10000)
+    }
+  }, [isSuccess, currentWithdrawTxType, hash])
+
+  const handleWithdraw = async () => {
+    if (!isConnected || !withdrawAmount || !VAULT_ADDRESS || !address) {
+      alert('Please connect wallet and enter amount')
+      return
+    }
+
+    try {
+      setWithdrawLoading(true)
+      setCurrentWithdrawTxType('withdraw')
+      setWithdrawSuccess(false)
+      setWithdrawHash(null)
+      resetWriteContract()
+      
+      const vault = await getVaultState(VAULT_ADDRESS as Address)
+      if (!vault || vault.totalSupply === BigInt(0)) {
+        alert('Vault has no shares. Cannot withdraw.')
+        setWithdrawLoading(false)
+        setCurrentWithdrawTxType(null)
+        return
+      }
+
+      const apiUrl = (process.env.NEXT_PUBLIC_INDEXER_API_URL || 'http://localhost:3001').replace(/\/$/, '')
+      const withdrawAmountUSDC = parseUnits(withdrawAmount, 6)
+      const sharesNeeded = (withdrawAmountUSDC * vault.totalSupply) / vault.totalAssets
+      
+      if (sharesNeeded > vaultShares) {
+        alert(`Insufficient balance. You have ${formatUnits(vaultShares, vault.decimals || 18)} shares.`)
+        setWithdrawLoading(false)
+        setCurrentWithdrawTxType(null)
+        return
+      }
+
+      const userWithdrawals = await fetch(`${apiUrl}/api/withdrawals?user=${address}`).then(r => r.json()).catch(() => [])
+      const hasSettledWithdrawals = userWithdrawals.some((w: any) => w.status === 'settled')
+      
+      if (hasSettledWithdrawals) {
+        writeContract({
+          address: VAULT_ADDRESS as Address,
+          abi: [
+            {
+              inputs: [
+                { name: 'sharesToRedeem', type: 'uint256' },
+              ],
+              name: 'claimSharesAndRequestRedeem',
+              outputs: [{ name: 'requestId', type: 'uint40' }],
+              stateMutability: 'nonpayable',
+              type: 'function',
+            },
+          ],
+          functionName: 'claimSharesAndRequestRedeem',
+          args: [sharesNeeded],
+        })
+      } else {
+        writeContract({
+          address: VAULT_ADDRESS as Address,
+          abi: [
+            {
+              inputs: [
+                { name: 'shares', type: 'uint256' },
+                { name: 'controller', type: 'address' },
+                { name: 'owner', type: 'address' },
+              ],
+              name: 'requestRedeem',
+              outputs: [{ name: 'requestId', type: 'uint256' }],
+              stateMutability: 'nonpayable',
+              type: 'function',
+            },
+          ],
+          functionName: 'requestRedeem',
+          args: [sharesNeeded, address, address],
+        })
+      }
+      
+    } catch (error: any) {
+      console.error('Withdraw failed:', error)
+      setWithdrawLoading(false)
+      setCurrentWithdrawTxType(null)
+      
+      if (error.message && (error.message.includes('claimSharesAndRequestRedeem') || error.message.includes('revert'))) {
+        try {
+          const vault = await getVaultState(VAULT_ADDRESS as Address)
+          const withdrawAmountUSDC = parseUnits(withdrawAmount, 6)
+          const sharesNeeded = (withdrawAmountUSDC * vault.totalSupply) / vault.totalAssets
+          
+          writeContract({
+            address: VAULT_ADDRESS as Address,
+            abi: [
+              {
+                inputs: [
+                  { name: 'shares', type: 'uint256' },
+                  { name: 'controller', type: 'address' },
+                  { name: 'owner', type: 'address' },
+                ],
+                name: 'requestRedeem',
+                outputs: [{ name: 'requestId', type: 'uint256' }],
+                stateMutability: 'nonpayable',
+                type: 'function',
+              },
+            ],
+            functionName: 'requestRedeem',
+            args: [sharesNeeded, address, address],
+          })
+        } catch (retryError) {
+          alert('Withdraw failed: ' + (retryError as Error).message)
+          setWithdrawLoading(false)
+          setCurrentWithdrawTxType(null)
+        }
+      } else {
+        alert('Withdraw failed: ' + (error?.message || 'Unknown error'))
+        setWithdrawLoading(false)
+        setCurrentWithdrawTxType(null)
+      }
+    }
+  }
+
   if (!isConnected) {
     return (
       <main className="min-h-screen bg-white text-black">
@@ -461,6 +641,24 @@ export default function KOLPage() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 sm:gap-8">
           <div className="border-2 border-black p-6 sm:p-8">
             <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">Deposit USDC</h2>
+            
+            {vaultShares > BigInt(0) && (
+              <div className="mb-4 p-3 bg-blue-50 border border-blue-300 rounded text-sm">
+                <p className="text-blue-800">
+                  Your Vault Balance: <span className="font-semibold">
+                    {vaultState ? formatUnits(
+                      vaultState.totalSupply > 0n 
+                        ? (vaultShares * vaultState.totalAssets) / vaultState.totalSupply
+                        : BigInt(0),
+                      6
+                    ) : '0.00'} USDC
+                  </span>
+                </p>
+                <p className="text-blue-600 text-xs mt-1">
+                  Shares: {parseFloat(formatUnits(vaultShares, vaultState?.decimals || 18)).toFixed(3).replace(/\.?0+$/, '')}
+                </p>
+              </div>
+            )}
             
             <div className="space-y-4">
               <div>
@@ -542,6 +740,98 @@ export default function KOLPage() {
                   <p className="text-sm text-green-700 mt-1">Your USDC has been deposited to the vault.</p>
                   {executedHash && <p className="text-xs text-green-600 mt-1 break-all">Tx Hash: {executedHash}</p>}
                   <p className="text-sm text-green-700 mt-2">Your USDC has been transferred to the vault.</p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="border-2 border-black p-6 sm:p-8">
+            <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">Withdraw USDC</h2>
+            
+            {vaultShares > BigInt(0) && (
+              <div className="mb-4 p-3 bg-blue-50 border border-blue-300 rounded text-sm">
+                <p className="text-blue-800">
+                  Available to Withdraw: <span className="font-semibold">
+                    {vaultState ? formatUnits(
+                      vaultState.totalSupply > 0n 
+                        ? (vaultShares * vaultState.totalAssets) / vaultState.totalSupply
+                        : BigInt(0),
+                      6
+                    ) : '0.00'} USDC
+                  </span>
+                </p>
+                <p className="text-blue-600 text-xs mt-1">
+                  Shares: {parseFloat(formatUnits(vaultShares, vaultState?.decimals || 18)).toFixed(3).replace(/\.?0+$/, '')}
+                </p>
+              </div>
+            )}
+            
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-semibold mb-2">Amount (USDC)</label>
+                <input
+                  type="number"
+                  value={withdrawAmount}
+                  onChange={(e) => setWithdrawAmount(e.target.value)}
+                  className="w-full border-2 border-black p-3 bg-white text-black focus:outline-none focus:ring-2 focus:ring-black"
+                  placeholder="0.00"
+                  step="0.01"
+                  min="0"
+                />
+                {vaultShares > BigInt(0) && vaultState && (
+                  <button
+                    onClick={() => {
+                      const maxAmount = vaultState.totalSupply > 0n 
+                        ? formatUnits((vaultShares * vaultState.totalAssets) / vaultState.totalSupply, 6)
+                        : '0'
+                      setWithdrawAmount(maxAmount)
+                    }}
+                    className="mt-2 text-xs text-blue-600 hover:text-blue-800 underline"
+                  >
+                    Use Max
+                  </button>
+                )}
+              </div>
+
+              <button
+                onClick={handleWithdraw}
+                disabled={withdrawLoading || isPending || !withdrawAmount || vaultShares === BigInt(0)}
+                className="w-full bg-red-600 text-white py-3 px-6 font-bold hover:bg-red-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+              >
+                {withdrawLoading || (isPending && currentWithdrawTxType === 'withdraw') ? 'Withdrawing...' : 'Withdraw from Vault'}
+              </button>
+
+              {isConfirming && currentWithdrawTxType === 'withdraw' && (
+                <div className="p-3 bg-blue-50 border border-blue-200 rounded">
+                  <p className="text-sm text-blue-700">Confirming withdrawal transaction...</p>
+                  <p className="text-xs text-blue-600 mt-1">Withdrawal will be pending until settlement.</p>
+                </div>
+              )}
+
+              {withdrawSuccess && (
+                <div className="p-4 bg-green-50 border-2 border-green-500 rounded">
+                  <p className="font-semibold text-green-800">✅ Withdrawal Requested!</p>
+                  <p className="text-sm text-green-700 mt-1">Your withdrawal request has been submitted.</p>
+                  <p className="text-xs text-green-600 mt-1">Status: <span className="font-semibold">Pending</span> (waiting for settlement)</p>
+                  {withdrawHash && (
+                    <>
+                      <p className="text-xs text-green-600 mt-2 break-all">Tx Hash: {withdrawHash}</p>
+                      <a
+                        href={`https://snowtrace.io/tx/${withdrawHash}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-blue-600 hover:underline mt-1 inline-block"
+                      >
+                        View on Snowtrace →
+                      </a>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {vaultShares === BigInt(0) && (
+                <div className="p-3 bg-gray-50 border border-gray-300 rounded">
+                  <p className="text-sm text-gray-600">You don't have any shares in the vault to withdraw.</p>
                 </div>
               )}
             </div>
