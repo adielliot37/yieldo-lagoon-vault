@@ -677,13 +677,65 @@ async function createDailySnapshot() {
       }
     }
 
+    // Calculate Yieldo's AUM by getting all Yieldo users' current share balances
+    const yieldoUsers = await colDeposits.distinct('user_address', {
+      $or: [
+        { source: 'yieldo' },
+        { intent_hash: { $exists: true, $ne: null } }
+      ],
+      status: { $in: ['executed', 'settled', 'requested'] }
+    });
+
+    let yieldoAUM = 0n;
+    const erc4626Abi = [
+      {
+        inputs: [{ name: 'account', type: 'address' }],
+        name: 'balanceOf',
+        outputs: [{ name: '', type: 'uint256' }],
+        stateMutability: 'view',
+        type: 'function',
+      },
+    ];
+
+    for (const user of yieldoUsers) {
+      try {
+        const userShares = await client.readContract({
+          address: VAULT_ADDRESS,
+          abi: erc4626Abi,
+          functionName: 'balanceOf',
+          args: [user],
+        });
+        
+        if (vault.totalSupply > 0n && userShares > 0n) {
+          const userAssets = vault.convertToAssets(userShares);
+          yieldoAUM += userAssets;
+        }
+      } catch (error) {
+        console.error(`Error fetching balance for user ${user}:`, error);
+      }
+    }
+
+    // Check if existing snapshot has incorrect AUM (matches entire vault AUM)
+    const existingSnapshot = await colSnapshots.findOne({ date: dateKey, vault_address: VAULT_ADDRESS });
+    if (existingSnapshot && existingSnapshot.total_assets) {
+      const existingAUM = BigInt(existingSnapshot.total_assets);
+      const vaultTotalAssets = vault.totalAssets || 0n;
+      // If existing AUM is very close to vault total (within 1%), it's likely incorrect
+      if (vaultTotalAssets > 0n && existingAUM > 0n) {
+        const ratio = Number(existingAUM) / Number(vaultTotalAssets);
+        if (ratio > 0.99) {
+          console.log(`⚠️  Detected incorrect AUM in snapshot for ${dateKey} (${existingAUM} vs vault total ${vaultTotalAssets}). Recalculating...`);
+        }
+      }
+    }
+
     await colSnapshots.updateOne(
       { date: dateKey, vault_address: VAULT_ADDRESS },
       {
         $set: {
           date: dateKey,
           vault_address: VAULT_ADDRESS,
-          total_assets: vault.totalAssets?.toString() || '0',
+          total_assets: yieldoAUM.toString(), // Yieldo's AUM, not entire vault's AUM
           total_supply: vault.totalSupply?.toString() || '0',
           total_deposits: totalDeposits,
           total_withdrawals: totalWithdrawals.toString(),
@@ -697,7 +749,8 @@ async function createDailySnapshot() {
 
     const depositsFormatted = (BigInt(totalDeposits) / BigInt(1e6)).toString();
     const withdrawalsFormatted = (totalWithdrawals / BigInt(1e6)).toString();
-    console.log(`Daily snapshot created for ${dateKey} (Yieldo only): deposits=${depositsFormatted} USDC, withdrawals=${withdrawalsFormatted} USDC`);
+    const aumFormatted = (yieldoAUM / BigInt(1e6)).toString();
+    console.log(`Daily snapshot created for ${dateKey} (Yieldo only): deposits=${depositsFormatted} USDC, withdrawals=${withdrawalsFormatted} USDC, AUM=${aumFormatted} USDC`);
   } catch (error) {
     console.error('Error creating daily snapshot:', error);
   }
@@ -1319,6 +1372,122 @@ app.post('/api/backfill/block', async (req, res) => {
     }
   } catch (error) {
     console.error('Error in block backfill:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Endpoint to delete a specific snapshot
+app.delete('/api/snapshots/:date', async (req, res) => {
+  try {
+    const { date } = req.params;
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+    }
+
+    const result = await colSnapshots.deleteOne({
+      date: date,
+      vault_address: VAULT_ADDRESS
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: `Snapshot for ${date} not found` });
+    }
+
+    res.json({
+      success: true,
+      message: `Deleted snapshot for ${date}`,
+      date: date
+    });
+  } catch (error) {
+    console.error('Error deleting snapshot:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Endpoint to recalculate AUM for all existing snapshots
+app.post('/api/snapshots/recalculate-aum', async (req, res) => {
+  try {
+    if (!VAULT_ADDRESS) {
+      return res.status(400).json({ error: 'VAULT_ADDRESS not configured' });
+    }
+
+    const vault = await Vault.fetch(VAULT_ADDRESS, client);
+    if (!vault) {
+      return res.status(500).json({ error: 'Failed to fetch vault' });
+    }
+
+    // Get all Yieldo users
+    const yieldoUsers = await colDeposits.distinct('user_address', {
+      $or: [
+        { source: 'yieldo' },
+        { intent_hash: { $exists: true, $ne: null } }
+      ],
+      status: { $in: ['executed', 'settled', 'requested'] }
+    });
+
+    // Calculate current Yieldo AUM
+    let yieldoAUM = 0n;
+    const erc4626Abi = [
+      {
+        inputs: [{ name: 'account', type: 'address' }],
+        name: 'balanceOf',
+        outputs: [{ name: '', type: 'uint256' }],
+        stateMutability: 'view',
+        type: 'function',
+      },
+    ];
+
+    console.log(`Recalculating Yieldo AUM from ${yieldoUsers.length} users...`);
+    for (const user of yieldoUsers) {
+      try {
+        const userShares = await client.readContract({
+          address: VAULT_ADDRESS,
+          abi: erc4626Abi,
+          functionName: 'balanceOf',
+          args: [user],
+        });
+        
+        if (vault.totalSupply > 0n && userShares > 0n) {
+          const userAssets = vault.convertToAssets(userShares);
+          yieldoAUM += userAssets;
+        }
+      } catch (error) {
+        console.error(`Error fetching balance for user ${user}:`, error);
+      }
+    }
+
+    // Get today's date to exclude it from recalculation (day is still running)
+    const today = new Date();
+    const todayKey = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 0, 0, 0))
+      .toISOString().slice(0, 10);
+
+    // Update all snapshots EXCEPT today's (since the day is still running)
+    const result = await colSnapshots.updateMany(
+      { 
+        vault_address: VAULT_ADDRESS,
+        date: { $ne: todayKey } // Exclude today's snapshot
+      },
+      {
+        $set: {
+          total_assets: yieldoAUM.toString(),
+          updated_at: new Date(),
+        },
+      }
+    );
+
+    const aumFormatted = (yieldoAUM / BigInt(1e6)).toString();
+    console.log(`Recalculated AUM for ${result.modifiedCount} past snapshots (excluding today ${todayKey}): ${aumFormatted} USDC`);
+
+    res.json({
+      success: true,
+      message: `Recalculated AUM for ${result.modifiedCount} past snapshots (excluding today)`,
+      yieldoAUM: yieldoAUM.toString(),
+      yieldoAUMFormatted: aumFormatted,
+      snapshotsUpdated: result.modifiedCount,
+      todayExcluded: todayKey,
+    });
+  } catch (error) {
+    console.error('Error recalculating snapshots AUM:', error);
     res.status(500).json({ error: error.message });
   }
 });

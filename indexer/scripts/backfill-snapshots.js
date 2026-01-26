@@ -100,15 +100,72 @@ async function backfillSnapshots() {
     const allDates = new Set([...Object.keys(depositsByDate), ...Object.keys(withdrawalsByDate)]);
     console.log(`\n📅 Found ${allDates.size} unique dates to process`);
     
+    // Calculate cumulative deposits and withdrawals for each date
+    const sortedDates = Array.from(allDates).sort();
+    let cumulativeDeposits = 0n;
+    let cumulativeWithdrawals = 0n;
+    const aumByDate = {};
+    
+    for (const dateKey of sortedDates) {
+      cumulativeDeposits += depositsByDate[dateKey] || 0n;
+      cumulativeWithdrawals += withdrawalsByDate[dateKey] || 0n;
+      // AUM approximation: cumulative deposits - cumulative withdrawals
+      // Note: This doesn't account for yield/gains, but is better than showing entire vault AUM
+      aumByDate[dateKey] = cumulativeDeposits - cumulativeWithdrawals;
+    }
+    
+    // For the most recent date, calculate actual Yieldo AUM from current share balances
+    if (sortedDates.length > 0) {
+      const mostRecentDate = sortedDates[sortedDates.length - 1];
+      const yieldoUsers = await colDeposits.distinct('user_address', {
+        $or: [
+          { source: 'yieldo' },
+          { intent_hash: { $exists: true, $ne: null } }
+        ],
+        status: { $in: ['executed', 'settled', 'requested'] }
+      });
+
+      const erc4626Abi = [
+        {
+          inputs: [{ name: 'account', type: 'address' }],
+          name: 'balanceOf',
+          outputs: [{ name: '', type: 'uint256' }],
+          stateMutability: 'view',
+          type: 'function',
+        },
+      ];
+
+      console.log(`\n📊 Calculating actual Yieldo AUM from ${yieldoUsers.length} users for most recent date...`);
+      let actualYieldoAUM = 0n;
+      for (const user of yieldoUsers) {
+        try {
+          const userShares = await client.readContract({
+            address: VAULT_ADDRESS,
+            abi: erc4626Abi,
+            functionName: 'balanceOf',
+            args: [user],
+          });
+          
+          if (vault.totalSupply > 0n && userShares > 0n) {
+            const userAssets = vault.convertToAssets(userShares);
+            actualYieldoAUM += userAssets;
+          }
+        } catch (error) {
+          console.error(`Error fetching balance for user ${user}:`, error);
+        }
+      }
+      
+      // Use actual AUM for the most recent date
+      aumByDate[mostRecentDate] = actualYieldoAUM;
+    }
+    
     let created = 0;
     let updated = 0;
     
-    for (const dateKey of Array.from(allDates).sort()) {
-      const startOfDay = new Date(dateKey + 'T00:00:00.000Z');
-      const endOfDay = new Date(dateKey + 'T23:59:59.999Z');
-      
+    for (const dateKey of sortedDates) {
       const totalDeposits = (depositsByDate[dateKey] || 0n).toString();
       const totalWithdrawals = (withdrawalsByDate[dateKey] || 0n).toString();
+      const yieldoAUM = (aumByDate[dateKey] || 0n).toString();
       
       const result = await colSnapshots.updateOne(
         { date: dateKey, vault_address: VAULT_ADDRESS },
@@ -116,6 +173,7 @@ async function backfillSnapshots() {
           $set: {
             date: dateKey,
             vault_address: VAULT_ADDRESS,
+            total_assets: yieldoAUM, // Yieldo's AUM, not entire vault's AUM
             total_deposits: totalDeposits,
             total_withdrawals: totalWithdrawals,
             updated_at: new Date(),
@@ -126,10 +184,10 @@ async function backfillSnapshots() {
       
       if (result.upsertedCount > 0) {
         created++;
-        console.log(`✅ Created snapshot for ${dateKey}: deposits=${totalDeposits}, withdrawals=${totalWithdrawals}`);
+        console.log(`✅ Created snapshot for ${dateKey}: deposits=${totalDeposits}, withdrawals=${totalWithdrawals}, AUM=${yieldoAUM}`);
       } else if (result.modifiedCount > 0) {
         updated++;
-        console.log(`🔄 Updated snapshot for ${dateKey}: deposits=${totalDeposits}, withdrawals=${totalWithdrawals}`);
+        console.log(`🔄 Updated snapshot for ${dateKey}: deposits=${totalDeposits}, withdrawals=${totalWithdrawals}, AUM=${yieldoAUM}`);
       }
     }
     
@@ -150,4 +208,5 @@ async function backfillSnapshots() {
 }
 
 backfillSnapshots();
+
 
