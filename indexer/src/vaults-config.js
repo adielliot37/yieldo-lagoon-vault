@@ -1,3 +1,11 @@
+import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+dotenv.config({ path: join(__dirname, '..', '.env') });
 
 export const VAULTS_CONFIG = [
   {
@@ -32,10 +40,11 @@ export const VAULTS_CONFIG = [
     },
     depositRouter: process.env.ETHEREUM_DEPOSIT_ROUTER_ADDRESS || '0xC75e95201bC574299a3C849181469B5B3B20cc97',
     rpcUrls: [
-      process.env.ETHEREUM_RPC_URL || 'https://eth.llamarpc.com',
+      ...(process.env.ETHEREUM_RPC_URL ? [process.env.ETHEREUM_RPC_URL] : []),
       'https://1rpc.io/eth',
       'https://rpc.ankr.com/eth',
       'https://eth-mainnet.public.blastapi.io',
+      ...(process.env.ETHEREUM_RPC_URL ? [] : ['https://eth.llamarpc.com']),
     ],
     subgraph: null,
     hasSettlement: true,

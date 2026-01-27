@@ -6,7 +6,7 @@ import cron from 'node-cron';
 import { Vault } from '@lagoon-protocol/v0-viem';
 import dotenv from 'dotenv';
 import { VAULTS_CONFIG, getVaultById } from './vaults-config.js';
-import { indexDepositRouterEventsForVault, indexVaultEventsForVault } from './vault-indexer.js';
+import { indexDepositRouterEventsForVault, indexVaultEventsForVault, setRateLimitHandler } from './vault-indexer.js';
 
 dotenv.config();
 
@@ -53,23 +53,36 @@ let colMeta;
 let colPendingYieldoWithdrawals;
 
 const clients = {};
+const rpcIndices = {};
+const rateLimitCooldowns = {};
 
-// Create clients with fallback support
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function getRetryAfter(error) {
+  if (error?.headers?.get) {
+    const retryAfter = error.headers.get('retry-after');
+    if (retryAfter) {
+      return parseInt(retryAfter, 10) * 1000;
+    }
+  }
+  return 120000;
+}
+
 for (const vault of VAULTS_CONFIG) {
   if (!clients[vault.chain]) {
+    rpcIndices[vault.chain] = 0;
     const primaryRpc = vault.rpcUrls[0];
     try {
       clients[vault.chain] = createPublicClient({
         chain: vault.chain === 'ethereum' ? mainnet : avalanche,
         transport: http(primaryRpc, {
-          timeout: 30000, // 30 second timeout
-          retryCount: 3,
+          timeout: 30000,
+          retryCount: 0,
         }),
       });
       console.log(`[${vault.chain}] Using RPC: ${primaryRpc}`);
     } catch (error) {
       console.error(`[${vault.chain}] Failed to create client with RPC ${primaryRpc}:`, error);
-      // Try fallback RPCs
       for (let i = 1; i < vault.rpcUrls.length; i++) {
         try {
           console.log(`[${vault.chain}] Trying fallback RPC ${i + 1}: ${vault.rpcUrls[i]}`);
@@ -77,9 +90,10 @@ for (const vault of VAULTS_CONFIG) {
             chain: vault.chain === 'ethereum' ? mainnet : avalanche,
             transport: http(vault.rpcUrls[i], {
               timeout: 30000,
-              retryCount: 3,
+              retryCount: 0,
             }),
           });
+          rpcIndices[vault.chain] = i;
           console.log(`[${vault.chain}] Successfully using fallback RPC: ${vault.rpcUrls[i]}`);
           break;
         } catch (fallbackError) {
@@ -91,6 +105,85 @@ for (const vault of VAULTS_CONFIG) {
       }
     }
   }
+}
+
+async function rotateRpcForChain(chain, vaultConfig) {
+  const currentIndex = rpcIndices[chain] || 0;
+  const nextIndex = (currentIndex + 1) % vaultConfig.rpcUrls.length;
+  
+  if (nextIndex === currentIndex) {
+    const cooldownKey = `${chain}_${vaultConfig.rpcUrls[currentIndex]}`;
+    const cooldown = rateLimitCooldowns[cooldownKey] || 120000;
+    console.log(`[${vaultConfig.id}] Rate limited. Waiting ${cooldown / 1000}s...`);
+    await sleep(cooldown);
+    return false;
+  }
+  
+  rpcIndices[chain] = nextIndex;
+  const newRpc = vaultConfig.rpcUrls[nextIndex];
+  console.log(`[${vaultConfig.id}] Switching to RPC: ${newRpc}`);
+  
+  try {
+    clients[chain] = createPublicClient({
+      chain: chain === 'ethereum' ? mainnet : avalanche,
+      transport: http(newRpc, {
+        timeout: 30000,
+        retryCount: 0,
+      }),
+    });
+      return true;
+  } catch (error) {
+    console.error(`[${vaultConfig.id}] Failed to create client with new RPC ${newRpc}:`, error);
+      return await rotateRpcForChain(chain, vaultConfig);
+  }
+}
+
+async function executeWithRateLimitHandling(vaultConfig, operation, maxRetries = 3) {
+  const chain = vaultConfig.chain;
+  let lastError = null;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const client = clients[chain];
+      return await operation(client);
+    } catch (error) {
+      lastError = error;
+      
+      const isRateLimit = error.status === 429 || 
+                         error.cause?.status === 429 ||
+                         error.message?.includes('429') ||
+                         error.message?.includes('rate limit') ||
+                         error.message?.includes('rate limited') ||
+                         error.message?.includes('Error 1015') ||
+                         error.message?.includes('You are being rate limited') ||
+                         (error.headers?.get && error.headers.get('retry-after')) ||
+                         (error.cause?.headers?.get && error.cause.headers.get('retry-after'));
+      
+      if (isRateLimit) {
+        const currentRpc = vaultConfig.rpcUrls[rpcIndices[chain] || 0];
+        const cooldownKey = `${chain}_${currentRpc}`;
+        const retryAfter = getRetryAfter(error);
+        
+        rateLimitCooldowns[cooldownKey] = retryAfter;
+        console.warn(`[${vaultConfig.id}] Rate limited (429) on RPC: ${currentRpc}`);
+        
+        const rotated = await rotateRpcForChain(chain, vaultConfig);
+        
+        if (!rotated) {
+          console.log(`[${vaultConfig.id}] Waiting ${retryAfter / 1000}s before retry...`);
+          await sleep(retryAfter);
+        } else {
+          await sleep(2000);
+        }
+        
+        continue;
+      }
+      
+      throw error;
+    }
+  }
+  
+  throw lastError;
 }
 
 function getClientForVault(vaultConfig) {
@@ -645,11 +738,19 @@ async function indexVaultEvents(fromBlock, toBlock) {
   }
 }
 
-async function createDailySnapshot() {
-  const now = new Date();
-  const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
-  const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59));
-  const dateKey = startOfDay.toISOString().slice(0, 10);
+async function createDailySnapshot(optionalDateStr) {
+  let startOfDay, endOfDay, dateKey;
+  if (optionalDateStr && /^\d{4}-\d{2}-\d{2}$/.test(optionalDateStr)) {
+    const [y, m, d] = optionalDateStr.split('-').map(Number);
+    startOfDay = new Date(Date.UTC(y, m - 1, d, 0, 0, 0));
+    endOfDay = new Date(Date.UTC(y, m - 1, d, 23, 59, 59));
+    dateKey = optionalDateStr;
+  } else {
+    const now = new Date();
+    startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
+    endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59));
+    dateKey = startOfDay.toISOString().slice(0, 10);
+  }
 
   const snapshotPromises = VAULTS_CONFIG.map(async (vaultConfig) => {
     try {
@@ -666,7 +767,7 @@ async function createDailySnapshot() {
           chain: vaultConfig.chain,
           source: 'yieldo',
           created_at: { $gte: startOfDay, $lte: endOfDay },
-          status: { $in: ['executed', 'settled', 'requested'] }
+          status: { $in: ['executed', 'settled'] }
         })
         .toArray();
       
@@ -684,59 +785,71 @@ async function createDailySnapshot() {
           status: { $in: ['pending', 'settled'] }
         })
         .toArray();
-      
-      let totalWithdrawals = 0n;
-      for (const w of yieldoWithdrawalsToday) {
-        if (w.assets) {
-          totalWithdrawals += BigInt(w.assets);
-        } else if (w.shares && vault.totalSupply > 0n) {
-          try {
-            const sharesBigInt = BigInt(w.shares);
-            const estimatedAssets = vault.convertToAssets(sharesBigInt);
-            totalWithdrawals += estimatedAssets;
-          } catch (error) {
-            console.error(`[${vaultConfig.id}] Error converting shares to assets for withdrawal ${w._id}:`, error);
+
+      const sumWithdrawalAssets = (withdrawals) => {
+        let total = 0n;
+        for (const w of withdrawals) {
+          if (w.assets) total += BigInt(w.assets);
+          else if (w.shares && vault.totalSupply > 0n) {
+            try {
+              total += vault.convertToAssets(BigInt(w.shares));
+            } catch (_) {}
           }
         }
-      }
-
-      const yieldoUsers = await colDeposits.distinct('user_address', {
-        vault_id: vaultConfig.id,
-        chain: vaultConfig.chain,
-        $or: [
-          { source: 'yieldo' },
-          { intent_hash: { $exists: true, $ne: null } }
-        ],
-        status: { $in: ['executed', 'settled', 'requested'] }
-      });
+        return total;
+      };
+      const totalYieldoWithdrawals = sumWithdrawalAssets(yieldoWithdrawalsToday);
+      const totalWithdrawals = totalYieldoWithdrawals;
 
       let yieldoAUM = 0n;
-      const erc4626Abi = [
-        {
-          inputs: [{ name: 'account', type: 'address' }],
-          name: 'balanceOf',
-          outputs: [{ name: '', type: 'uint256' }],
-          stateMutability: 'view',
-          type: 'function',
-        },
-      ];
-
-      for (const user of yieldoUsers) {
-        try {
-          const userShares = await client.readContract({
-            address: vaultConfig.address,
-            abi: erc4626Abi,
-            functionName: 'balanceOf',
-            args: [user],
-          });
-          
-          if (vault.totalSupply > 0n && userShares > 0n) {
-            const userAssets = vault.convertToAssets(userShares);
-            yieldoAUM += userAssets;
-          }
-        } catch (error) {
-          console.error(`[${vaultConfig.id}] Error fetching balance for user ${user}:`, error);
-        }
+      
+      const prevDate = new Date(startOfDay);
+      prevDate.setUTCDate(prevDate.getUTCDate() - 1);
+      const prevDateKey = prevDate.toISOString().slice(0, 10);
+      
+      const prevSnapshot = await colSnapshots.findOne({
+        date: prevDateKey,
+        vault_id: vaultConfig.id,
+        chain: vaultConfig.chain,
+      });
+      
+      const useCumulative = prevSnapshot && prevSnapshot.total_assets;
+      
+      if (useCumulative) {
+        const prevAUM = BigInt(prevSnapshot.total_assets || '0');
+        yieldoAUM = prevAUM + BigInt(totalDeposits) - totalYieldoWithdrawals;
+        if (yieldoAUM < 0n) yieldoAUM = 0n;
+        console.log(`[${vaultConfig.id}] AUM (cumulative from prev): prev=${(prevAUM / BigInt(10 ** vaultConfig.asset.decimals)).toString()}, deposits=${(BigInt(totalDeposits) / BigInt(10 ** vaultConfig.asset.decimals)).toString()}, yieldo_wd=${(totalYieldoWithdrawals / BigInt(10 ** vaultConfig.asset.decimals)).toString()}, result=${(yieldoAUM / BigInt(10 ** vaultConfig.asset.decimals)).toString()}`);
+      } else {
+        const allDepositsUpToDate = await colDeposits
+          .find({
+            vault_id: vaultConfig.id,
+            chain: vaultConfig.chain,
+            source: 'yieldo',
+            created_at: { $lte: endOfDay },
+            status: { $in: ['executed', 'settled'] }
+          })
+          .toArray();
+        
+        const allYieldoWithdrawalsUpToDate = await colWithdrawals
+          .find({
+            vault_id: vaultConfig.id,
+            chain: vaultConfig.chain,
+            source: 'yieldo',
+            created_at: { $lte: endOfDay },
+            status: { $in: ['pending', 'settled'] }
+          })
+          .toArray();
+        
+        const totalAllDeposits = allDepositsUpToDate.reduce(
+          (acc, d) => acc + BigInt(d.amount || '0'),
+          0n
+        );
+        
+        const totalAllYieldoWithdrawals = sumWithdrawalAssets(allYieldoWithdrawalsUpToDate);
+        yieldoAUM = totalAllDeposits - totalAllYieldoWithdrawals;
+        if (yieldoAUM < 0n) yieldoAUM = 0n;
+        console.log(`[${vaultConfig.id}] AUM (calculated from scratch for ${dateKey}): deposits=${(totalAllDeposits / BigInt(10 ** vaultConfig.asset.decimals)).toString()}, yieldo_withdrawals=${(totalAllYieldoWithdrawals / BigInt(10 ** vaultConfig.asset.decimals)).toString()}, result=${(yieldoAUM / BigInt(10 ** vaultConfig.asset.decimals)).toString()}, deposit_count=${allDepositsUpToDate.length}, withdrawal_count=${allYieldoWithdrawalsUpToDate.length}`);
       }
 
       await colSnapshots.updateOne(
@@ -796,15 +909,16 @@ const lastProcessedBlocks = {};
 async function startIndexing() {
   await initDatabase();
 
-  // Test RPC connections before starting
+  setRateLimitHandler((vaultConfig, operation) => {
+    return executeWithRateLimitHandling(vaultConfig, operation);
+  });
+
   for (const vault of VAULTS_CONFIG) {
     const client = getClientForVault(vault);
     try {
       console.log(`[${vault.chain}] Testing RPC connection...`);
       const testBlock = await client.getBlockNumber();
       console.log(`[${vault.chain}] ✅ RPC connection successful. Latest block: ${testBlock}`);
-      
-      // Test eth_getLogs support
       try {
         await client.getLogs({
           address: vault.address,
@@ -924,7 +1038,6 @@ async function startIndexing() {
                   ))) {
                 return;
               }
-              // Enhanced error logging
               console.error(`[${vault.id}] Indexing error:`, indexError);
               if (indexError.message) {
                 console.error(`[${vault.id}] Error message: ${indexError.message}`);
@@ -935,7 +1048,6 @@ async function startIndexing() {
               if (indexError.shortMessage) {
                 console.error(`[${vault.id}] Short message: ${indexError.shortMessage}`);
               }
-              // Check if it's an RPC method error (like eth_getLogs not supported)
               if (indexError.message && indexError.message.includes('eth_getLogs')) {
                 console.error(`[${vault.id}] CRITICAL: RPC does not support eth_getLogs. Current RPC: ${vault.rpcUrls[0]}`);
                 console.error(`[${vault.id}] Please check ETHEREUM_RPC_URL environment variable on Railway`);
@@ -944,7 +1056,6 @@ async function startIndexing() {
             }
           }
         } catch (error) {
-          // Enhanced error logging for debugging
           console.error(`[${vault.id}] Error in indexing loop:`, error);
           if (error.message) {
             console.error(`[${vault.id}] Error message: ${error.message}`);
@@ -955,7 +1066,6 @@ async function startIndexing() {
           if (error.cause) {
             console.error(`[${vault.id}] Error cause:`, error.cause);
           }
-          // Log RPC URL being used
           const client = getClientForVault(vault);
           console.error(`[${vault.id}] Using RPC: ${vault.rpcUrls[0]} for chain ${vault.chain}`);
         }
@@ -966,7 +1076,7 @@ async function startIndexing() {
     } catch (error) {
       console.error('Error in indexing loop:', error);
     }
-  }, 5000);
+  }, 30000);
 
   cron.schedule('0 0 * * *', createDailySnapshot);
   console.log('Daily snapshot scheduler started');
@@ -1993,8 +2103,24 @@ app.post('/api/snapshots/recalculate-aum', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`Indexer API running on port ${PORT}`);
-  startIndexing();
-});
+
+async function runBackfill(dateStr) {
+  await initDatabase();
+  await createDailySnapshot(dateStr);
+  if (mongoClient) await mongoClient.close();
+}
+
+const isBackfill = process.argv[2] === 'backfill-snapshot' && process.argv[3];
+if (isBackfill) {
+  const dateStr = process.argv[3];
+  runBackfill(dateStr).then(() => process.exit(0)).catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+} else {
+  app.listen(PORT, () => {
+    console.log(`Indexer API running on port ${PORT}`);
+    startIndexing();
+  });
+}
 

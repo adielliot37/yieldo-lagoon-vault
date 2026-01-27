@@ -9,11 +9,8 @@ import { useState } from 'react'
 
 const projectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || '0dd252f3816efa3917348bf2b60af0aa'
 
-// Custom RPC URLs - explicitly set to avoid eth.merkle.io
 const avalancheRpcUrl = process.env.NEXT_PUBLIC_AVALANCHE_RPC_URL || 'https://api.avax.network/ext/bc/C/rpc'
 const ethereumRpcUrl = process.env.NEXT_PUBLIC_ETHEREUM_RPC_URL || 'https://1rpc.io/eth'
-
-// Configure chains with explicit RPC URLs (no eth.merkle.io)
 const chains = [avalanche, mainnet] as const
 
 const { wallets } = getDefaultWallets({

@@ -1,6 +1,21 @@
 import { parseAbiItem } from 'viem';
 import { Vault } from '@lagoon-protocol/v0-viem';
 
+let rateLimitHandler = null;
+
+export function setRateLimitHandler(handler) {
+  rateLimitHandler = handler;
+}
+
+async function safeGetLogs(vaultConfig, client, params) {
+  if (rateLimitHandler) {
+    return await rateLimitHandler(vaultConfig, async (c) => {
+      return await c.getLogs(params);
+    });
+  }
+  return await client.getLogs(params);
+}
+
 export async function indexDepositRouterEventsForVault(
   vaultConfig,
   client,
@@ -17,7 +32,7 @@ export async function indexDepositRouterEventsForVault(
       return;
     }
 
-    const intentCreatedLogs = await client.getLogs({
+    const intentCreatedLogs = await safeGetLogs(vaultConfig, client, {
       address: vaultConfig.depositRouter,
       event: parseAbiItem('event DepositIntentCreated(bytes32 indexed intentHash, address indexed user, address indexed vault, address asset, uint256 amount, uint256 nonce, uint256 deadline)'),
       fromBlock,
@@ -52,7 +67,7 @@ export async function indexDepositRouterEventsForVault(
       );
     }
 
-    const depositExecutedLogs = await client.getLogs({
+    const depositExecutedLogs = await safeGetLogs(vaultConfig, client, {
       address: vaultConfig.depositRouter,
       event: parseAbiItem('event DepositExecuted(bytes32 indexed intentHash, address indexed user, address indexed vault, uint256 amount)'),
       fromBlock,
@@ -101,7 +116,7 @@ export async function indexDepositRouterEventsForVault(
       console.log(`[${vaultConfig.id}] Deposit executed: ${intentHash} for user ${user}, amount: ${amount.toString()}, tx: ${log.transactionHash}`);
     }
 
-    const depositRequestSubmittedLogs = await client.getLogs({
+    const depositRequestSubmittedLogs = await safeGetLogs(vaultConfig, client, {
       address: vaultConfig.depositRouter,
       event: parseAbiItem('event DepositRequestSubmitted(bytes32 indexed intentHash, address indexed user, address indexed vault, uint256 amount, uint256 requestId)'),
       fromBlock,
@@ -180,7 +195,7 @@ export async function indexVaultEventsForVault(
 
     let depositRequestedLogs = [];
     try {
-      depositRequestedLogs = await client.getLogs({
+      depositRequestedLogs = await safeGetLogs(vaultConfig, client, {
         address: vaultConfig.address,
         event: parseAbiItem('event DepositRequest(address indexed controller, address indexed owner, uint256 indexed requestId, address sender, uint256 assets)'),
         fromBlock,
@@ -193,7 +208,7 @@ export async function indexVaultEventsForVault(
     let lagoonDepositRequestedLogs = [];
     if (depositRequestedLogs.length === 0) {
       try {
-        lagoonDepositRequestedLogs = await client.getLogs({
+        lagoonDepositRequestedLogs = await safeGetLogs(vaultConfig, client, {
           address: vaultConfig.address,
           event: parseAbiItem('event DepositRequested(address indexed user, uint256 indexed epochId, uint256 amount)'),
           fromBlock,
@@ -430,7 +445,7 @@ export async function indexVaultEventsForVault(
       console.log(`[${vaultConfig.id}] Yieldo DepositRequested indexed: epochId ${epochId} for user ${user}, amount: ${amount.toString()}`);
     }
 
-    const depositLogs = await client.getLogs({
+    const depositLogs = await safeGetLogs(vaultConfig, client, {
       address: vaultConfig.address,
       event: parseAbiItem('event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares)'),
       fromBlock,
@@ -547,7 +562,7 @@ export async function indexVaultEventsForVault(
       }
     }
 
-    const depositSettledLogs = await client.getLogs({
+    const depositSettledLogs = await safeGetLogs(vaultConfig, client, {
       address: vaultConfig.address,
       event: parseAbiItem('event DepositSettled(address indexed user, uint256 indexed epochId, uint256 shares)'),
       fromBlock,
@@ -589,7 +604,7 @@ export async function indexVaultEventsForVault(
 
     let redeemRequestedLogs = [];
     try {
-      redeemRequestedLogs = await client.getLogs({
+      redeemRequestedLogs = await safeGetLogs(vaultConfig, client, {
         address: vaultConfig.address,
         event: parseAbiItem('event RedeemRequest(address indexed controller, address indexed owner, uint256 indexed requestId, address sender, uint256 shares)'),
         fromBlock,
@@ -601,12 +616,12 @@ export async function indexVaultEventsForVault(
     
     let lagoonRedeemRequestedLogs = [];
     try {
-      lagoonRedeemRequestedLogs = await client.getLogs({
-        address: vaultConfig.address,
-        event: parseAbiItem('event RedeemRequested(address indexed user, uint256 indexed epochId, uint256 shares)'),
-        fromBlock,
-        toBlock,
-      });
+        lagoonRedeemRequestedLogs = await safeGetLogs(vaultConfig, client, {
+          address: vaultConfig.address,
+          event: parseAbiItem('event RedeemRequested(address indexed user, uint256 indexed epochId, uint256 shares)'),
+          fromBlock,
+          toBlock,
+        });
     } catch (e) {
       console.log(`[${vaultConfig.id}] Error querying Lagoon RedeemRequested: ${e.message}`);
     }
@@ -691,7 +706,7 @@ export async function indexVaultEventsForVault(
 
     let redeemSettledLogs = [];
     try {
-      redeemSettledLogs = await client.getLogs({
+      redeemSettledLogs = await safeGetLogs(vaultConfig, client, {
         address: vaultConfig.address,
         event: parseAbiItem('event RedeemSettled(address indexed controller, address indexed owner, uint256 indexed requestId, address receiver, uint256 assets)'),
         fromBlock,
@@ -704,7 +719,7 @@ export async function indexVaultEventsForVault(
     let lagoonRedeemSettledLogs = [];
     if (redeemSettledLogs.length === 0) {
       try {
-        lagoonRedeemSettledLogs = await client.getLogs({
+        lagoonRedeemSettledLogs = await safeGetLogs(vaultConfig, client, {
           address: vaultConfig.address,
           event: parseAbiItem('event RedeemSettled(address indexed user, uint256 indexed epochId, uint256 assets)'),
           fromBlock,

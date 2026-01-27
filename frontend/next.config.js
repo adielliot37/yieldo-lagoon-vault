@@ -2,7 +2,6 @@
 const nextConfig = {
   reactStrictMode: true,
   webpack: (config, { isServer }) => {
-    // Ignore optional dependencies that aren't needed for browser
     config.resolve.fallback = { 
       fs: false, 
       net: false, 
@@ -18,7 +17,6 @@ const nextConfig = {
       path: false,
     };
 
-    // Ignore optional peer dependencies that cause warnings
     if (!isServer) {
       config.resolve.alias = {
         ...config.resolve.alias,
@@ -27,7 +25,6 @@ const nextConfig = {
       };
     }
 
-    // Suppress warnings for optional dependencies
     config.ignoreWarnings = [
       { module: /node_modules\/@metamask\/sdk/ },
       { module: /node_modules\/pino/ },

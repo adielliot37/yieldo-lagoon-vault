@@ -2,7 +2,7 @@
 
 import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract, useChainId, usePublicClient, useSwitchChain } from 'wagmi'
 import { ConnectButton } from '@rainbow-me/rainbowkit'
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import Link from 'next/link'
 import { parseUnits, formatUnits, Address } from 'viem'
 import { getVaultState } from '@/lib/lagoon'
@@ -26,8 +26,10 @@ export default function KOLPage() {
   
   const [amount, setAmount] = useState('')
   const [vaultState, setVaultState] = useState<any>(null)
+  const [vaultSharesCache, setVaultSharesCache] = useState<Map<string, { shares: bigint; timestamp: number }>>(new Map())
   const [loading, setLoading] = useState(false)
   const [nonce, setNonce] = useState<bigint>(BigInt(0))
+  const fetchingRef = useRef<{ state: boolean; shares: boolean }>({ state: false, shares: false })
   const [approvalHash, setApprovalHash] = useState<`0x${string}` | undefined>()
   const [isApproving, setIsApproving] = useState(false)
   const [currentTxType, setCurrentTxType] = useState<'approve' | 'deposit' | 'execute' | null>(null)
@@ -88,7 +90,7 @@ export default function KOLPage() {
   useEffect(() => {
     if (address) {
       fetchPendingIntents()
-      const interval = setInterval(fetchPendingIntents, 30000)
+      const interval = setInterval(fetchPendingIntents, 60000)
       return () => clearInterval(interval)
     }
   }, [address])
@@ -101,7 +103,7 @@ export default function KOLPage() {
       setCurrentTxType(null)
       setTimeout(() => {
         fetchPendingIntents()
-      }, 2000)
+      }, 5000)
       
       setTimeout(() => {
         setDepositSuccess(false)
@@ -115,9 +117,10 @@ export default function KOLPage() {
     functionName: 'nonces',
     args: address ? [address] : undefined,
     query: { 
-      enabled: !!address && !!DEPOSIT_ROUTER_ADDRESS,
-      staleTime: 30 * 1000,
+      enabled: !!address && !!DEPOSIT_ROUTER_ADDRESS && chainId === selectedVault.chainId,
+      staleTime: 60 * 1000,
       refetchOnWindowFocus: false,
+      refetchInterval: false,
     },
   })
 
@@ -136,10 +139,10 @@ export default function KOLPage() {
     args: address && allowanceAddress ? [address, allowanceAddress as Address] : undefined,
     query: { 
       enabled: !!address && !!allowanceAddress && chainId === selectedVault.chainId,
-      staleTime: 0, // Always refetch when vault/chain changes
+      staleTime: 30 * 1000,
       refetchInterval: false,
-      refetchOnWindowFocus: true, // Refetch when window regains focus
-      refetchOnMount: true, // Always refetch on mount
+      refetchOnWindowFocus: false,
+      refetchOnMount: true,
     },
   })
 
@@ -148,38 +151,9 @@ export default function KOLPage() {
       setIsApproving(false)
       setCurrentTxType(null)
       resetWriteContract()
-      const timers = [
-        setTimeout(() => refetchAllowance(), 1000),
-        setTimeout(() => refetchAllowance(), 3000),
-        setTimeout(() => refetchAllowance(), 5000),
-      ]
-      return () => timers.forEach(timer => clearTimeout(timer))
+      setTimeout(() => refetchAllowance(), 2000)
     }
   }, [isApprovalSuccess, refetchAllowance, resetWriteContract])
-
-  useEffect(() => {
-    if (isApprovalConfirming) {
-      const interval = setInterval(() => {
-        refetchAllowance()
-      }, 2000)
-      return () => clearInterval(interval)
-    }
-  }, [isApprovalConfirming, refetchAllowance])
-
-  // Refetch allowance when vault/chain changes or when amount is entered
-  useEffect(() => {
-    if (amount && address && allowanceAddress && chainId === selectedVault.chainId) {
-      // Only refetch if allowance is not already loading and we have an amount
-      if (!isLoadingAllowance) {
-        const timer = setTimeout(() => {
-          refetchAllowance().catch(err => {
-            console.error('Failed to refetch allowance:', err)
-          })
-        }, 300) // Small debounce
-        return () => clearTimeout(timer)
-      }
-    }
-  }, [amount, selectedVaultId, chainId]) // Only depend on key values that should trigger refetch
 
   useEffect(() => {
     if (isConnected && chainId !== selectedVault.chainId) {
@@ -189,25 +163,39 @@ export default function KOLPage() {
 
   useEffect(() => {
     if (VAULT_ADDRESS && isConnected && chainId === selectedVault.chainId) {
-      // Clear previous vault's data before fetching new data
-      setVaultShares(BigInt(0))
-      setVaultState(null)
-      fetchVaultState()
-      fetchVaultShares()
-      // Refetch allowance when vault changes
+      const cacheKey = `${selectedVaultId}_${chainId}`
+      const cachedShares = vaultSharesCache.get(cacheKey)
+      const now = Date.now()
+      const CACHE_TTL = 10 * 1000
+
+      if (!fetchingRef.current.state) {
+        fetchingRef.current.state = true
+        fetchVaultState().finally(() => {
+          fetchingRef.current.state = false
+        })
+      }
+
+      if (cachedShares && (now - cachedShares.timestamp) < CACHE_TTL) {
+        setVaultShares(cachedShares.shares)
+      } else if (!fetchingRef.current.shares) {
+        fetchingRef.current.shares = true
+        fetchVaultShares().finally(() => {
+          fetchingRef.current.shares = false
+        })
+      }
+
       if (address && allowanceAddress) {
-        setTimeout(() => refetchAllowance(), 500) // Small delay to ensure addresses are updated
+        setTimeout(() => refetchAllowance(), 500)
       }
     } else {
-      // If not connected or wrong chain, clear data
       setVaultShares(BigInt(0))
       setVaultState(null)
+      fetchingRef.current = { state: false, shares: false }
     }
-  }, [VAULT_ADDRESS, isConnected, address, selectedVaultId, chainId, allowanceAddress, refetchAllowance]) // Use selectedVaultId to ensure refetch on vault change
+  }, [VAULT_ADDRESS, isConnected, address, selectedVaultId, chainId, allowanceAddress, refetchAllowance])
 
   const fetchVaultShares = async () => {
     if (!address || !VAULT_ADDRESS || chainId !== selectedVault.chainId) {
-      // If conditions not met, set to zero
       setVaultShares(BigInt(0))
       return
     }
@@ -220,16 +208,15 @@ export default function KOLPage() {
         args: [address],
       }) as bigint
       
-      // CRITICAL FIX: Only update if still on the same vault
       if (balance !== undefined && selectedVaultId === selectedVault.id) {
         setVaultShares(balance)
+        const cacheKey = `${selectedVaultId}_${chainId}`
+        setVaultSharesCache(prev => new Map(prev.set(cacheKey, { shares: balance, timestamp: Date.now() })))
       } else {
-        // If vault changed during fetch, set to zero
         setVaultShares(BigInt(0))
       }
     } catch (error) {
       console.error('Failed to fetch vault shares:', error)
-      // On error, set to zero (not previous vault's data)
       setVaultShares(BigInt(0))
     }
   }
@@ -248,7 +235,9 @@ export default function KOLPage() {
     try {
       setLoading(true)
       const state = await getVaultState(VAULT_ADDRESS as Address, selectedVault.chain)
-      setVaultState(state)
+      if (selectedVaultId === selectedVault.id) {
+        setVaultState(state)
+      }
     } catch (error) {
       console.error('Failed to fetch vault state:', error)
       alert('Failed to fetch vault state: ' + (error as Error).message)
@@ -261,7 +250,6 @@ export default function KOLPage() {
     const vault = getVaultById(vaultId)
     if (!vault) return
     
-    // CRITICAL FIX: Clear previous vault's data immediately
     setVaultShares(BigInt(0))
     setVaultState(null)
     setAmount('')
@@ -436,21 +424,28 @@ export default function KOLPage() {
       setCurrentTxType('execute')
       setPendingIntentHash(hashToExecute)
       
-      const isValid = await publicClient?.readContract({
-        address: DEPOSIT_ROUTER_ADDRESS as Address,
-        abi: DEPOSIT_ROUTER_ABI,
-        functionName: 'isIntentValid',
-        args: [hashToExecute],
-      })
-
-      if (!isValid) {
-        const depositRecord = await publicClient?.readContract({
+      const [isValid, depositRecord, currentAllowance] = await Promise.all([
+        publicClient?.readContract({
+          address: DEPOSIT_ROUTER_ADDRESS as Address,
+          abi: DEPOSIT_ROUTER_ABI,
+          functionName: 'isIntentValid',
+          args: [hashToExecute],
+        }),
+        publicClient?.readContract({
           address: DEPOSIT_ROUTER_ADDRESS as Address,
           abi: DEPOSIT_ROUTER_ABI,
           functionName: 'getDeposit',
           args: [hashToExecute],
-        }) as any
+        }) as Promise<any>,
+        publicClient?.readContract({
+          address: USDC_ADDRESS as Address,
+          abi: ERC20_ABI,
+          functionName: 'allowance',
+          args: [address!, DEPOSIT_ROUTER_ADDRESS as Address],
+        }) as Promise<bigint>,
+      ])
 
+      if (!isValid) {
         if (!depositRecord || depositRecord.user === '0x0000000000000000000000000000000000000000') {
           alert('Intent not found. It may not have been created yet.')
         } else if (depositRecord.executed) {
@@ -466,20 +461,6 @@ export default function KOLPage() {
         setCurrentTxType(null)
         return
       }
-
-      const currentAllowance = await publicClient?.readContract({
-        address: USDC_ADDRESS as Address,
-        abi: ERC20_ABI,
-        functionName: 'allowance',
-        args: [address!, DEPOSIT_ROUTER_ADDRESS as Address],
-      }) as bigint
-
-      const depositRecord = await publicClient?.readContract({
-        address: DEPOSIT_ROUTER_ADDRESS as Address,
-        abi: DEPOSIT_ROUTER_ABI,
-        functionName: 'getDeposit',
-        args: [hashToExecute],
-      }) as any
 
       if (currentAllowance < BigInt(depositRecord.amount)) {
         alert(`Insufficient allowance. You need to approve ${formatUnits(BigInt(depositRecord.amount), selectedVault.asset.decimals)} ${selectedVault.asset.symbol}. Current allowance: ${formatUnits(currentAllowance, selectedVault.asset.decimals)} ${selectedVault.asset.symbol}`)
@@ -559,7 +540,7 @@ export default function KOLPage() {
       
       setTimeout(() => {
         fetchPendingIntents()
-      }, 2000)
+      }, 5000)
       
       setTimeout(() => {
         setExecuteSuccess(false)
@@ -600,9 +581,16 @@ export default function KOLPage() {
       .catch(err => console.error('Failed to mark withdrawal:', err))
       
       setTimeout(() => {
+        const cacheKey = `${selectedVaultId}_${chainId}`
+        setVaultSharesCache(prev => {
+          const newMap = new Map(prev)
+          newMap.delete(cacheKey)
+          return newMap
+        })
+        fetchingRef.current = { state: false, shares: false }
         fetchVaultShares()
         fetchVaultState()
-      }, 2000)
+      }, 3000)
       
       setTimeout(() => {
         setWithdrawSuccess(false)
@@ -624,7 +612,7 @@ export default function KOLPage() {
       setWithdrawHash(null)
       resetWriteContract()
       
-      const vault = await getVaultState(VAULT_ADDRESS as Address)
+      const vault = vaultState || await getVaultState(VAULT_ADDRESS as Address, selectedVault.chain)
       if (!vault || vault.totalSupply === BigInt(0)) {
         alert('Vault has no shares. Cannot withdraw.')
         setWithdrawLoading(false)
@@ -691,7 +679,7 @@ export default function KOLPage() {
       
       if (error.message && (error.message.includes('claimSharesAndRequestRedeem') || error.message.includes('revert'))) {
         try {
-          const vault = await getVaultState(VAULT_ADDRESS as Address)
+          const vault = vaultState || await getVaultState(VAULT_ADDRESS as Address, selectedVault.chain)
           const withdrawAmountUSDC = parseUnits(withdrawAmount, selectedVault.asset.decimals)
           const sharesNeeded = (withdrawAmountUSDC * vault.totalSupply) / vault.totalAssets
           
@@ -1101,7 +1089,10 @@ export default function KOLPage() {
             <div className="flex justify-between items-center mb-4 sm:mb-6">
               <h2 className="text-xl sm:text-2xl font-bold">Vault Information</h2>
               <button
-                onClick={fetchVaultState}
+                onClick={() => {
+                  fetchingRef.current.state = false
+                  fetchVaultState()
+                }}
                 disabled={loading || !VAULT_ADDRESS}
                 className="bg-black text-white py-1.5 px-3 text-xs sm:text-sm font-semibold hover:bg-gray-800 disabled:bg-gray-400 transition-colors"
               >

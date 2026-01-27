@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "backfill-snapshot": "node scripts/backfill-snapshot.js",
+    "recalculate-all-snapshots": "node scripts/recalculate-all-snapshots.js"
   },
   "dependencies": {
     "@lagoon-protocol/v0-viem": "^0.1.0",

@@ -131,65 +131,123 @@ const formatShares = (shares: string | number | undefined | null): string => {
   return total.toFixed(3).replace(/\.?0+$/, '')
 }
 
+interface VaultDataCache {
+  deposits: DepositIntent[]
+  withdrawals: Withdrawal[]
+  aum: AUMData | null
+}
+
 export default function Dashboard() {
   const { address, isConnected } = useAccount()
-  const [deposits, setDeposits] = useState<DepositIntent[]>([])
-  const [withdrawals, setWithdrawals] = useState<Withdrawal[]>([])
+  const [dataCache, setDataCache] = useState<Map<string, VaultDataCache>>(new Map())
   const [snapshots, setSnapshots] = useState<Snapshot[]>([])
-  const [aumData, setAumData] = useState<AUMData | null>(null)
   const [loading, setLoading] = useState(true)
   const [selectedVaultId, setSelectedVaultId] = useState<string | null>('combined')
+  const [initialLoadComplete, setInitialLoadComplete] = useState(false)
+
+  const ITEMS_PER_PAGE = 5
+  const [depositsPage, setDepositsPage] = useState(1)
+  const [withdrawalsPage, setWithdrawalsPage] = useState(1)
+  const [snapshotsPage, setSnapshotsPage] = useState(1)
 
   useEffect(() => {
-    if (isConnected && address) {
-      fetchUserData()
+    if (isConnected && address && !initialLoadComplete) {
+      loadAllVaultData()
     }
-  }, [isConnected, address, selectedVaultId])
+  }, [isConnected, address, initialLoadComplete])
 
-  const fetchUserData = async () => {
+  const deposits = selectedVaultId ? (dataCache.get(selectedVaultId)?.deposits || []) : []
+  const withdrawals = selectedVaultId ? (dataCache.get(selectedVaultId)?.withdrawals || []) : []
+  const aumData = selectedVaultId ? (dataCache.get(selectedVaultId)?.aum || null) : null
+
+  useEffect(() => {
+    setDepositsPage(1)
+    setWithdrawalsPage(1)
+    setSnapshotsPage(1)
+  }, [selectedVaultId])
+
+  const depositsPaginated = deposits.slice((depositsPage - 1) * ITEMS_PER_PAGE, depositsPage * ITEMS_PER_PAGE)
+  const withdrawalsPaginated = withdrawals.slice((withdrawalsPage - 1) * ITEMS_PER_PAGE, withdrawalsPage * ITEMS_PER_PAGE)
+  const snapshotsPaginated = snapshots.slice((snapshotsPage - 1) * ITEMS_PER_PAGE, snapshotsPage * ITEMS_PER_PAGE)
+
+  const depositsTotalPages = Math.ceil(deposits.length / ITEMS_PER_PAGE) || 1
+  const withdrawalsTotalPages = Math.ceil(withdrawals.length / ITEMS_PER_PAGE) || 1
+  const snapshotsTotalPages = Math.ceil(snapshots.length / ITEMS_PER_PAGE) || 1
+
+  const loadAllVaultData = async () => {
+    if (!address) return
+    
     try {
+      setLoading(true)
       const apiUrl = (process.env.NEXT_PUBLIC_INDEXER_API_URL || 'http://localhost:3001').replace(/\/$/, '')
-      let depositsUrl = `${apiUrl}/api/deposits?user=${address}`
-      let withdrawalsUrl = `${apiUrl}/api/withdrawals?user=${address}`
-      let aumUrl = `${apiUrl}/api/aum?user=${address}`
-      
-      if (selectedVaultId && selectedVaultId !== 'combined') {
-        const vault = getVaultById(selectedVaultId)
-        if (vault) {
-          depositsUrl += `&vault_id=${selectedVaultId}&chain=${vault.chain}`
-          withdrawalsUrl += `&vault_id=${selectedVaultId}&chain=${vault.chain}`
-          aumUrl += `&vault_id=${selectedVaultId}&chain=${vault.chain}`
-        }
-      } else {
-        aumUrl += '&combined=true'
-      }
-      
-      const [depositsRes, withdrawalsRes, snapshotsRes, aumRes] = await Promise.all([
-        fetch(depositsUrl),
-        fetch(withdrawalsUrl),
-        fetch(`${apiUrl}/api/snapshots?combined=true`),
-        fetch(aumUrl)
-      ])
-      
-      if (depositsRes.ok) {
-        const depositsData = await depositsRes.json()
-        setDeposits(depositsData)
-      }
-      
-      if (withdrawalsRes.ok) {
-        const withdrawalsData = await withdrawalsRes.json()
-        setWithdrawals(withdrawalsData)
-      }
-      
-      if (snapshotsRes.ok) {
-        const snapshotsData = await snapshotsRes.json()
-        setSnapshots(snapshotsData)
-      }
+      const cache = new Map<string, VaultDataCache>()
+      cache.set('combined', { deposits: [], withdrawals: [], aum: null })
+      VAULTS_CONFIG.forEach(vault => {
+        cache.set(vault.id, { deposits: [], withdrawals: [], aum: null })
+      })
 
-      if (aumRes.ok) {
-        const aumData = await aumRes.json()
-        setAumData(aumData)
-      }
+      const apiCalls: Promise<void>[] = []
+      apiCalls.push(
+        Promise.all([
+          fetch(`${apiUrl}/api/deposits?user=${address}`),
+          fetch(`${apiUrl}/api/withdrawals?user=${address}`),
+          fetch(`${apiUrl}/api/aum?user=${address}&combined=true`)
+        ]).then(async ([depositsRes, withdrawalsRes, aumRes]) => {
+          const current = cache.get('combined')!
+          const updates: Partial<VaultDataCache> = {}
+          
+          if (depositsRes.ok) {
+            updates.deposits = await depositsRes.json()
+          }
+          if (withdrawalsRes.ok) {
+            updates.withdrawals = await withdrawalsRes.json()
+          }
+          if (aumRes.ok) {
+            updates.aum = await aumRes.json()
+          }
+          
+          cache.set('combined', { ...current, ...updates })
+        })
+      )
+
+      VAULTS_CONFIG.forEach(vault => {
+        apiCalls.push(
+          Promise.all([
+            fetch(`${apiUrl}/api/deposits?user=${address}&vault_id=${vault.id}&chain=${vault.chain}`),
+            fetch(`${apiUrl}/api/withdrawals?user=${address}&vault_id=${vault.id}&chain=${vault.chain}`),
+            fetch(`${apiUrl}/api/aum?user=${address}&vault_id=${vault.id}&chain=${vault.chain}`)
+          ]).then(async ([depositsRes, withdrawalsRes, aumRes]) => {
+            const current = cache.get(vault.id)!
+            const updates: Partial<VaultDataCache> = {}
+            
+            if (depositsRes.ok) {
+              updates.deposits = await depositsRes.json()
+            }
+            if (withdrawalsRes.ok) {
+              updates.withdrawals = await withdrawalsRes.json()
+            }
+            if (aumRes.ok) {
+              updates.aum = await aumRes.json()
+            }
+            
+            cache.set(vault.id, { ...current, ...updates })
+          })
+        )
+      })
+
+      apiCalls.push(
+        fetch(`${apiUrl}/api/snapshots?combined=true`)
+          .then(async (res) => {
+            if (res.ok) {
+              const data = await res.json()
+              setSnapshots(data)
+            }
+          })
+      )
+
+      await Promise.all(apiCalls)
+      setDataCache(cache)
+      setInitialLoadComplete(true)
     } catch (error) {
       console.error('Failed to fetch data:', error)
     } finally {
@@ -291,8 +349,9 @@ export default function Dashboard() {
             ) : deposits.length === 0 ? (
               <p className="text-gray-700">No deposits found</p>
             ) : (
+              <>
               <div className="space-y-4">
-                {deposits.map((deposit) => {
+                {depositsPaginated.map((deposit) => {
                   const decimals = deposit.asset_decimals || 6
                   const symbol = deposit.asset_symbol || 'USDC'
                   return (
@@ -359,6 +418,26 @@ export default function Dashboard() {
                   )
                 })}
               </div>
+              <div className="flex items-center justify-between mt-4 pt-4 border-t border-gray-300">
+                <button
+                  onClick={() => setDepositsPage(p => Math.max(1, p - 1))}
+                  disabled={depositsPage <= 1}
+                  className="px-3 py-1.5 border border-black disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 rounded text-sm"
+                >
+                  Previous
+                </button>
+                <span className="text-sm text-gray-600">
+                  Page {depositsPage} of {depositsTotalPages}
+                </span>
+                <button
+                  onClick={() => setDepositsPage(p => Math.min(depositsTotalPages, p + 1))}
+                  disabled={depositsPage >= depositsTotalPages}
+                  className="px-3 py-1.5 border border-black disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 rounded text-sm"
+                >
+                  Next
+                </button>
+              </div>
+              </>
             )}
           </div>
 
@@ -369,8 +448,9 @@ export default function Dashboard() {
             ) : withdrawals.length === 0 ? (
               <p className="text-gray-700">No withdrawals found</p>
             ) : (
+              <>
               <div className="space-y-4">
-                {withdrawals.map((withdrawal) => {
+                {withdrawalsPaginated.map((withdrawal) => {
                   const decimals = withdrawal.asset_decimals || 6
                   const symbol = withdrawal.asset_symbol || 'USDC'
                   return (
@@ -438,6 +518,26 @@ export default function Dashboard() {
                   )
                 })}
               </div>
+              <div className="flex items-center justify-between mt-4 pt-4 border-t border-gray-300">
+                <button
+                  onClick={() => setWithdrawalsPage(p => Math.max(1, p - 1))}
+                  disabled={withdrawalsPage <= 1}
+                  className="px-3 py-1.5 border border-black disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 rounded text-sm"
+                >
+                  Previous
+                </button>
+                <span className="text-sm text-gray-600">
+                  Page {withdrawalsPage} of {withdrawalsTotalPages}
+                </span>
+                <button
+                  onClick={() => setWithdrawalsPage(p => Math.min(withdrawalsTotalPages, p + 1))}
+                  disabled={withdrawalsPage >= withdrawalsTotalPages}
+                  className="px-3 py-1.5 border border-black disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 rounded text-sm"
+                >
+                  Next
+                </button>
+              </div>
+              </>
             )}
           </div>
 
@@ -451,13 +551,14 @@ export default function Dashboard() {
             ) : snapshots.length === 0 ? (
               <p className="text-gray-500 italic">No snapshots yet. Snapshots are generated daily by the indexer.</p>
             ) : (
+              <>
               <div className="space-y-4">
-                {snapshots.slice(0, 7).map((snapshot, idx) => {
+                {snapshotsPaginated.map((snapshot) => {
                   const aum = snapshot.total_assets || snapshot.aum || '0'
-                  const deposits = snapshot.total_deposits || snapshot.totalDeposits || '0'
-                  const withdrawals = snapshot.total_withdrawals || snapshot.totalWithdrawals || '0'
+                  const snapshotDeposits = snapshot.total_deposits || snapshot.totalDeposits || '0'
+                  const snapshotWithdrawals = snapshot.total_withdrawals || snapshot.totalWithdrawals || '0'
                   return (
-                    <div key={idx} className="border border-gray-300 p-4">
+                    <div key={snapshot.date} className="border border-gray-300 p-4">
                       <div className="flex justify-between items-start mb-2">
                         <div>
                           <span className="font-semibold">{snapshot.date}</span>
@@ -474,13 +575,33 @@ export default function Dashboard() {
                         <span className="text-lg font-bold">{formatUSDC(aum)} USDC</span>
                       </div>
                       <div className="text-sm text-gray-600 space-y-1">
-                        <p>Deposits: {formatUSDC(deposits)} USDC</p>
-                        <p>Withdrawals: {formatUSDC(withdrawals)} USDC</p>
+                        <p>Deposits: {formatUSDC(snapshotDeposits)} USDC</p>
+                        <p>Withdrawals: {formatUSDC(snapshotWithdrawals)} USDC</p>
                       </div>
                     </div>
                   )
                 })}
               </div>
+              <div className="flex items-center justify-between mt-4 pt-4 border-t border-gray-300">
+                <button
+                  onClick={() => setSnapshotsPage(p => Math.max(1, p - 1))}
+                  disabled={snapshotsPage <= 1}
+                  className="px-3 py-1.5 border border-black disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 rounded text-sm"
+                >
+                  Previous
+                </button>
+                <span className="text-sm text-gray-600">
+                  Page {snapshotsPage} of {snapshotsTotalPages}
+                </span>
+                <button
+                  onClick={() => setSnapshotsPage(p => Math.min(snapshotsTotalPages, p + 1))}
+                  disabled={snapshotsPage >= snapshotsTotalPages}
+                  className="px-3 py-1.5 border border-black disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 rounded text-sm"
+                >
+                  Next
+                </button>
+              </div>
+              </>
             )}
           </div>
         </div>

@@ -15,6 +15,9 @@ const clients = {
   }),
 }
 
+const vaultStateCache = new Map<string, { state: any; timestamp: number }>()
+const CACHE_TTL = 15 * 1000
+
 export function getClientForChain(chain: 'avalanche' | 'ethereum') {
   return clients[chain]
 }
@@ -66,7 +69,15 @@ export async function getVaultAPR(
   }
 }
 
-export async function getVaultState(vaultAddress: Address, chain: 'avalanche' | 'ethereum' = 'avalanche') {
+export async function getVaultState(vaultAddress: Address, chain: 'avalanche' | 'ethereum' = 'avalanche', forceRefresh = false) {
+  const cacheKey = `${vaultAddress.toLowerCase()}_${chain}`
+  const cached = vaultStateCache.get(cacheKey)
+  const now = Date.now()
+
+  if (!forceRefresh && cached && (now - cached.timestamp) < CACHE_TTL) {
+    return cached.state
+  }
+
   const vault = await fetchVault(vaultAddress, chain)
   
   if (!vault) {
@@ -79,7 +90,7 @@ export async function getVaultState(vaultAddress: Address, chain: 'avalanche' | 
   
   const sharePriceFormatted = Number(sharePrice) / Number(BigInt(10) ** BigInt(vault.underlyingDecimals))
   
-  return {
+  const state = {
     address: vaultAddress,
     name: vault.name || 'Lagoon Vault',
     symbol: vault.symbol || 'VAULT',
@@ -103,5 +114,8 @@ export async function getVaultState(vaultAddress: Address, chain: 'avalanche' | 
     cooldown: vault.cooldown,
     isWhitelistActivated: vault.isWhitelistActivated,
   }
+
+  vaultStateCache.set(cacheKey, { state, timestamp: now })
+  return state
 }
 
