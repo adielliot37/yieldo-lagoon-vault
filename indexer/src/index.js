@@ -54,14 +54,42 @@ let colPendingYieldoWithdrawals;
 
 const clients = {};
 
+// Create clients with fallback support
 for (const vault of VAULTS_CONFIG) {
   if (!clients[vault.chain]) {
     const primaryRpc = vault.rpcUrls[0];
-    clients[vault.chain] = createPublicClient({
-      chain: vault.chain === 'ethereum' ? mainnet : avalanche,
-      transport: http(primaryRpc),
-    });
-    console.log(`[${vault.chain}] Using RPC: ${primaryRpc}`);
+    try {
+      clients[vault.chain] = createPublicClient({
+        chain: vault.chain === 'ethereum' ? mainnet : avalanche,
+        transport: http(primaryRpc, {
+          timeout: 30000, // 30 second timeout
+          retryCount: 3,
+        }),
+      });
+      console.log(`[${vault.chain}] Using RPC: ${primaryRpc}`);
+    } catch (error) {
+      console.error(`[${vault.chain}] Failed to create client with RPC ${primaryRpc}:`, error);
+      // Try fallback RPCs
+      for (let i = 1; i < vault.rpcUrls.length; i++) {
+        try {
+          console.log(`[${vault.chain}] Trying fallback RPC ${i + 1}: ${vault.rpcUrls[i]}`);
+          clients[vault.chain] = createPublicClient({
+            chain: vault.chain === 'ethereum' ? mainnet : avalanche,
+            transport: http(vault.rpcUrls[i], {
+              timeout: 30000,
+              retryCount: 3,
+            }),
+          });
+          console.log(`[${vault.chain}] Successfully using fallback RPC: ${vault.rpcUrls[i]}`);
+          break;
+        } catch (fallbackError) {
+          console.error(`[${vault.chain}] Fallback RPC ${vault.rpcUrls[i]} also failed:`, fallbackError.message);
+        }
+      }
+      if (!clients[vault.chain]) {
+        throw new Error(`[${vault.chain}] All RPC endpoints failed for ${vault.chain}`);
+      }
+    }
   }
 }
 
@@ -768,24 +796,59 @@ const lastProcessedBlocks = {};
 async function startIndexing() {
   await initDatabase();
 
+  // Test RPC connections before starting
+  for (const vault of VAULTS_CONFIG) {
+    const client = getClientForVault(vault);
+    try {
+      console.log(`[${vault.chain}] Testing RPC connection...`);
+      const testBlock = await client.getBlockNumber();
+      console.log(`[${vault.chain}] ✅ RPC connection successful. Latest block: ${testBlock}`);
+      
+      // Test eth_getLogs support
+      try {
+        await client.getLogs({
+          address: vault.address,
+          fromBlock: testBlock - 10n,
+          toBlock: testBlock,
+        });
+        console.log(`[${vault.chain}] ✅ RPC supports eth_getLogs`);
+      } catch (logsError) {
+        console.error(`[${vault.chain}] ❌ RPC does NOT support eth_getLogs:`, logsError.message);
+        if (logsError.message && logsError.message.includes('eth_getLogs')) {
+          console.error(`[${vault.chain}] CRITICAL: Current RPC (${vault.rpcUrls[0]}) does not support eth_getLogs method!`);
+          console.error(`[${vault.chain}] Please set ${vault.chain.toUpperCase()}_RPC_URL environment variable to a working RPC endpoint`);
+        }
+      }
+    } catch (error) {
+      console.error(`[${vault.chain}] ❌ RPC connection failed:`, error.message);
+      console.error(`[${vault.chain}] Current RPC URL: ${vault.rpcUrls[0]}`);
+      throw new Error(`Failed to connect to ${vault.chain} RPC: ${error.message}`);
+    }
+  }
+
   for (const vault of VAULTS_CONFIG) {
     const metaKey = `lastProcessedBlock_${vault.chain}`;
     const meta = await colMeta.findOne({ _id: metaKey });
     const client = getClientForVault(vault);
     
-    if (meta?.value) {
-      lastProcessedBlocks[vault.chain] = BigInt(meta.value);
-    } else {
-      const latestBlock = await client.getBlockNumber();
-      lastProcessedBlocks[vault.chain] = latestBlock - 100n;
-      await colMeta.updateOne(
-        { _id: metaKey },
-        { $set: { value: lastProcessedBlocks[vault.chain].toString(), updated_at: new Date() } },
-        { upsert: true }
-      );
+    try {
+      if (meta?.value) {
+        lastProcessedBlocks[vault.chain] = BigInt(meta.value);
+      } else {
+        const latestBlock = await client.getBlockNumber();
+        lastProcessedBlocks[vault.chain] = latestBlock - 100n;
+        await colMeta.updateOne(
+          { _id: metaKey },
+          { $set: { value: lastProcessedBlocks[vault.chain].toString(), updated_at: new Date() } },
+          { upsert: true }
+        );
+      }
+      
+      console.log(`[${vault.chain}] Starting indexing from block ${lastProcessedBlocks[vault.chain]}`);
+    } catch (error) {
+      console.error(`[${vault.chain}] Failed to initialize indexing:`, error.message);
+      throw error;
     }
-    
-    console.log(`[${vault.chain}] Starting indexing from block ${lastProcessedBlocks[vault.chain]}`);
   }
 
   async function getSafeBlockNumber() {
@@ -861,12 +924,40 @@ async function startIndexing() {
                   ))) {
                 return;
               }
+              // Enhanced error logging
               console.error(`[${vault.id}] Indexing error:`, indexError);
+              if (indexError.message) {
+                console.error(`[${vault.id}] Error message: ${indexError.message}`);
+              }
+              if (indexError.code) {
+                console.error(`[${vault.id}] Error code: ${indexError.code}`);
+              }
+              if (indexError.shortMessage) {
+                console.error(`[${vault.id}] Short message: ${indexError.shortMessage}`);
+              }
+              // Check if it's an RPC method error (like eth_getLogs not supported)
+              if (indexError.message && indexError.message.includes('eth_getLogs')) {
+                console.error(`[${vault.id}] CRITICAL: RPC does not support eth_getLogs. Current RPC: ${vault.rpcUrls[0]}`);
+                console.error(`[${vault.id}] Please check ETHEREUM_RPC_URL environment variable on Railway`);
+              }
               throw indexError;
             }
           }
         } catch (error) {
+          // Enhanced error logging for debugging
           console.error(`[${vault.id}] Error in indexing loop:`, error);
+          if (error.message) {
+            console.error(`[${vault.id}] Error message: ${error.message}`);
+          }
+          if (error.code) {
+            console.error(`[${vault.id}] Error code: ${error.code}`);
+          }
+          if (error.cause) {
+            console.error(`[${vault.id}] Error cause:`, error.cause);
+          }
+          // Log RPC URL being used
+          const client = getClientForVault(vault);
+          console.error(`[${vault.id}] Using RPC: ${vault.rpcUrls[0]} for chain ${vault.chain}`);
         }
       });
 
