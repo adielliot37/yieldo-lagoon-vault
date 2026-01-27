@@ -129,16 +129,17 @@ export default function KOLPage() {
 
   const allowanceAddress = DEPOSIT_ROUTER_ADDRESS
 
-  const { data: allowance, refetch: refetchAllowance } = useReadContract({
+  const { data: allowance, refetch: refetchAllowance, isLoading: isLoadingAllowance } = useReadContract({
     address: USDC_ADDRESS as Address,
     abi: ERC20_ABI,
     functionName: 'allowance',
     args: address && allowanceAddress ? [address, allowanceAddress as Address] : undefined,
     query: { 
-      enabled: !!address && !!allowanceAddress,
-      staleTime: 10 * 1000,
+      enabled: !!address && !!allowanceAddress && chainId === selectedVault.chainId,
+      staleTime: 0, // Always refetch when vault/chain changes
       refetchInterval: false,
-      refetchOnWindowFocus: false,
+      refetchOnWindowFocus: true, // Refetch when window regains focus
+      refetchOnMount: true, // Always refetch on mount
     },
   })
 
@@ -165,6 +166,21 @@ export default function KOLPage() {
     }
   }, [isApprovalConfirming, refetchAllowance])
 
+  // Refetch allowance when vault/chain changes or when amount is entered
+  useEffect(() => {
+    if (amount && address && allowanceAddress && chainId === selectedVault.chainId) {
+      // Only refetch if allowance is not already loading and we have an amount
+      if (!isLoadingAllowance) {
+        const timer = setTimeout(() => {
+          refetchAllowance().catch(err => {
+            console.error('Failed to refetch allowance:', err)
+          })
+        }, 300) // Small debounce
+        return () => clearTimeout(timer)
+      }
+    }
+  }, [amount, selectedVaultId, chainId]) // Only depend on key values that should trigger refetch
+
   useEffect(() => {
     if (isConnected && chainId !== selectedVault.chainId) {
       console.log(`Chain mismatch: connected to ${chainId}, vault requires ${selectedVault.chainId}`)
@@ -178,12 +194,16 @@ export default function KOLPage() {
       setVaultState(null)
       fetchVaultState()
       fetchVaultShares()
+      // Refetch allowance when vault changes
+      if (address && allowanceAddress) {
+        setTimeout(() => refetchAllowance(), 500) // Small delay to ensure addresses are updated
+      }
     } else {
       // If not connected or wrong chain, clear data
       setVaultShares(BigInt(0))
       setVaultState(null)
     }
-  }, [VAULT_ADDRESS, isConnected, address, selectedVaultId, chainId]) // Use selectedVaultId to ensure refetch on vault change
+  }, [VAULT_ADDRESS, isConnected, address, selectedVaultId, chainId, allowanceAddress, refetchAllowance]) // Use selectedVaultId to ensure refetch on vault change
 
   const fetchVaultShares = async () => {
     if (!address || !VAULT_ADDRESS || chainId !== selectedVault.chainId) {
@@ -787,28 +807,60 @@ export default function KOLPage() {
                 />
               </div>
 
-              {allowance !== undefined && allowance !== null && amount && (
+              {amount && (
                 <div className={`text-sm p-3 border rounded ${
-                  (allowance as bigint) >= parseUnits(amount, selectedVault.asset.decimals) 
+                  isLoadingAllowance 
+                    ? 'bg-yellow-50 border-yellow-300 text-yellow-800'
+                    : allowance !== undefined && allowance !== null && (allowance as bigint) >= parseUnits(amount, selectedVault.asset.decimals)
                     ? 'bg-green-50 border-green-300 text-green-800' 
                     : 'bg-gray-50 border-gray-300 text-gray-600'
                 }`}>
-                  <p>
-                    Allowance: <span className="font-semibold">{formatUnits(allowance as bigint, selectedVault.asset.decimals)} {selectedVault.asset.symbol}</span>
-                    {isApprovalConfirming && (
-                      <span className="ml-2 text-xs">(Confirming...)</span>
-                    )}
-                  </p>
-                  {(allowance as bigint) < parseUnits(amount, selectedVault.asset.decimals) && !isApprovalConfirming && (
-                    <p className="text-red-600 mt-1 text-xs">Insufficient allowance. Please approve first.</p>
-                  )}
-                  {isApprovalSuccess && (allowance as bigint) < parseUnits(amount, selectedVault.asset.decimals) && (
-                    <p className="text-blue-600 mt-1 text-xs">Approval confirmed! Refreshing allowance...</p>
+                  {isLoadingAllowance ? (
+                    <p>
+                      <span className="font-semibold">Checking allowance...</span>
+                      <button 
+                        onClick={() => refetchAllowance()} 
+                        className="ml-2 text-xs text-blue-600 hover:underline"
+                      >
+                        Retry
+                      </button>
+                    </p>
+                  ) : allowance !== undefined && allowance !== null ? (
+                    <>
+                      <p>
+                        Allowance: <span className="font-semibold">{formatUnits(allowance as bigint, selectedVault.asset.decimals)} {selectedVault.asset.symbol}</span>
+                        {isApprovalConfirming && (
+                          <span className="ml-2 text-xs">(Confirming...)</span>
+                        )}
+                        <button 
+                          onClick={() => refetchAllowance()} 
+                          className="ml-2 text-xs text-blue-600 hover:underline"
+                        >
+                          Refresh
+                        </button>
+                      </p>
+                      {(allowance as bigint) < parseUnits(amount, selectedVault.asset.decimals) && !isApprovalConfirming && (
+                        <p className="text-red-600 mt-1 text-xs">Insufficient allowance. Please approve first.</p>
+                      )}
+                      {isApprovalSuccess && (allowance as bigint) < parseUnits(amount, selectedVault.asset.decimals) && (
+                        <p className="text-blue-600 mt-1 text-xs">Approval confirmed! Refreshing allowance...</p>
+                      )}
+                    </>
+                  ) : (
+                    <p>
+                      <span className="text-gray-600">Allowance: Not loaded</span>
+                      <button 
+                        onClick={() => refetchAllowance()} 
+                        className="ml-2 text-xs text-blue-600 hover:underline"
+                      >
+                        Check Allowance
+                      </button>
+                    </p>
                   )}
                 </div>
               )}
 
-              {allowance !== undefined && allowance !== null && (allowance as bigint) < parseUnits(amount || '0', selectedVault.asset.decimals) && (
+              {amount && allowance !== undefined && allowance !== null && (allowance as bigint) < parseUnits(amount || '0', selectedVault.asset.decimals) && (
                 <button
                   onClick={handleApprove}
                   disabled={loading || isPending || isApprovalConfirming || isApproving || !amount}
@@ -827,10 +879,17 @@ export default function KOLPage() {
 
               <button
                 onClick={handleDeposit}
-                disabled={loading || isPending || !amount || chainId !== selectedVault.chainId || (allowance !== undefined && allowance !== null && (allowance as bigint) < parseUnits(amount, selectedVault.asset.decimals))}
+                disabled={
+                  loading || 
+                  isPending || 
+                  !amount || 
+                  chainId !== selectedVault.chainId || 
+                  isLoadingAllowance ||
+                  (allowance !== undefined && allowance !== null && (allowance as bigint) < parseUnits(amount, selectedVault.asset.decimals))
+                }
                 className="w-full bg-black text-white py-3 px-6 font-bold hover:bg-gray-800 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
               >
-                {loading || isPending ? 'Depositing...' : 'Deposit to Vault'}
+                {loading || isPending ? 'Depositing...' : isLoadingAllowance ? 'Checking Allowance...' : 'Deposit to Vault'}
               </button>
 
               {isConfirming && (
