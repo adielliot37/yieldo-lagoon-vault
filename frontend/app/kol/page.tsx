@@ -1,26 +1,29 @@
 'use client'
 
-import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract, useChainId, usePublicClient } from 'wagmi'
+import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract, useChainId, usePublicClient, useSwitchChain } from 'wagmi'
 import { ConnectButton } from '@rainbow-me/rainbowkit'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import Link from 'next/link'
 import { parseUnits, formatUnits, Address } from 'viem'
 import { getVaultState } from '@/lib/lagoon'
 import { signDepositIntent, getIntentHash, type DepositIntent } from '@/lib/eip712'
+import { VAULTS_CONFIG, getVaultById, VaultConfig } from '@/lib/vaults-config'
+import { VaultSelector } from '@/components/VaultSelector'
 import ERC20_ABI from '@/lib/erc20-abi.json'
 import DEPOSIT_ROUTER_ABI from '@/lib/deposit-router-abi.json'
-
-const USDC_ADDRESS = process.env.NEXT_PUBLIC_USDC_ADDRESS || '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E'
-const VAULT_ADDRESS = process.env.NEXT_PUBLIC_LAGOON_VAULT_ADDRESS || '0x3048925b3ea5a8c12eecccb8810f5f7544db54af'
-const DEPOSIT_ROUTER_ADDRESS = process.env.NEXT_PUBLIC_DEPOSIT_ROUTER_ADDRESS
-
-if (typeof window !== 'undefined' && !DEPOSIT_ROUTER_ADDRESS) {
-  console.error('⚠️ NEXT_PUBLIC_DEPOSIT_ROUTER_ADDRESS is not set in .env file!')
-} 
 
 export default function KOLPage() {
   const { address, isConnected } = useAccount()
   const chainId = useChainId()
+  const { switchChain } = useSwitchChain()
+  const [selectedVaultId, setSelectedVaultId] = useState<string>(VAULTS_CONFIG[0].id)
+  const selectedVault = useMemo(() => {
+    return getVaultById(selectedVaultId) || VAULTS_CONFIG[0]
+  }, [selectedVaultId])
+  const USDC_ADDRESS = selectedVault.asset.address as Address
+  const VAULT_ADDRESS = selectedVault.address as Address
+  const DEPOSIT_ROUTER_ADDRESS = selectedVault.depositRouter as Address | undefined
+  
   const [amount, setAmount] = useState('')
   const [vaultState, setVaultState] = useState<any>(null)
   const [loading, setLoading] = useState(false)
@@ -96,7 +99,6 @@ export default function KOLPage() {
       setDepositHash(hash)
       setLoading(false)
       setCurrentTxType(null)
-      
       setTimeout(() => {
         fetchPendingIntents()
       }, 2000)
@@ -125,13 +127,15 @@ export default function KOLPage() {
     }
   }, [userNonce])
 
+  const allowanceAddress = DEPOSIT_ROUTER_ADDRESS
+
   const { data: allowance, refetch: refetchAllowance } = useReadContract({
     address: USDC_ADDRESS as Address,
     abi: ERC20_ABI,
     functionName: 'allowance',
-    args: address && DEPOSIT_ROUTER_ADDRESS ? [address, DEPOSIT_ROUTER_ADDRESS as Address] : undefined,
+    args: address && allowanceAddress ? [address, allowanceAddress as Address] : undefined,
     query: { 
-      enabled: !!address && !!DEPOSIT_ROUTER_ADDRESS,
+      enabled: !!address && !!allowanceAddress,
       staleTime: 10 * 1000,
       refetchInterval: false,
       refetchOnWindowFocus: false,
@@ -160,15 +164,22 @@ export default function KOLPage() {
       return () => clearInterval(interval)
     }
   }, [isApprovalConfirming, refetchAllowance])
+
   useEffect(() => {
-    if (VAULT_ADDRESS && isConnected) {
+    if (isConnected && chainId !== selectedVault.chainId) {
+      console.log(`Chain mismatch: connected to ${chainId}, vault requires ${selectedVault.chainId}`)
+    }
+  }, [isConnected, chainId, selectedVault])
+
+  useEffect(() => {
+    if (VAULT_ADDRESS && isConnected && chainId === selectedVault.chainId) {
       fetchVaultState()
       fetchVaultShares()
     }
-  }, [VAULT_ADDRESS, isConnected, address])
+  }, [VAULT_ADDRESS, isConnected, address, selectedVault, chainId])
 
   const fetchVaultShares = async () => {
-    if (!address || !VAULT_ADDRESS) return
+    if (!address || !VAULT_ADDRESS || chainId !== selectedVault.chainId) return
     
     try {
       const balance = await publicClient?.readContract({
@@ -192,9 +203,14 @@ export default function KOLPage() {
       return
     }
     
+    if (chainId !== selectedVault.chainId) {
+      console.warn(`Cannot fetch vault state: chain mismatch (${chainId} vs ${selectedVault.chainId})`)
+      return
+    }
+    
     try {
       setLoading(true)
-      const state = await getVaultState(VAULT_ADDRESS as Address)
+      const state = await getVaultState(VAULT_ADDRESS as Address, selectedVault.chain)
       setVaultState(state)
     } catch (error) {
       console.error('Failed to fetch vault state:', error)
@@ -203,18 +219,50 @@ export default function KOLPage() {
       setLoading(false)
     }
   }
+  
+  const handleVaultChange = async (vaultId: string) => {
+    const vault = getVaultById(vaultId)
+    if (!vault) return
+    
+    setSelectedVaultId(vaultId)
+    if (isConnected && chainId !== vault.chainId) {
+      try {
+        await switchChain({ chainId: vault.chainId })
+      } catch (error) {
+        console.error('Failed to switch chain:', error)
+        alert(`Please switch to ${vault.chain} network to interact with this vault`)
+      }
+    }
+    setAmount('')
+    setVaultState(null)
+    setPendingIntentHash(null)
+  }
 
   const handleApprove = async () => {
     if (!isConnected || !amount) {
       alert('Please connect wallet and enter amount')
       return
     }
+    
+    if (chainId !== selectedVault.chainId) {
+      alert(`Please switch to ${selectedVault.chain} network`)
+      try {
+        await switchChain({ chainId: selectedVault.chainId })
+      } catch (error) {
+        console.error('Failed to switch chain:', error)
+      }
+      return
+    }
+
+    if (!DEPOSIT_ROUTER_ADDRESS || DEPOSIT_ROUTER_ADDRESS === '0x0000000000000000000000000000000000000000') {
+      alert('Deposit router not configured for this vault. Set the vault\'s deposit router in .env and restart.')
+      return
+    }
 
     try {
       setIsApproving(true)
       setCurrentTxType('approve')
-      const depositAmount = parseUnits(amount, 6)
-      
+      const depositAmount = parseUnits(amount, selectedVault.asset.decimals)
       writeContract({
         address: USDC_ADDRESS as Address,
         abi: ERC20_ABI,
@@ -235,6 +283,28 @@ export default function KOLPage() {
       return
     }
 
+    if (chainId !== selectedVault.chainId) {
+      alert(`Please switch to ${selectedVault.chain} network first`)
+      try {
+        await switchChain({ chainId: selectedVault.chainId })
+      } catch (e) {
+        console.error('Switch chain failed:', e)
+      }
+      return
+    }
+
+    if (!DEPOSIT_ROUTER_ADDRESS || DEPOSIT_ROUTER_ADDRESS === '0x0000000000000000000000000000000000000000') {
+      alert('Deposit router not configured for this vault. Set the vault\'s deposit router in .env and restart.')
+      return
+    }
+
+    const depositAmount = parseUnits(amount, selectedVault.asset.decimals)
+    const allowanceBn = allowance != null ? BigInt(allowance as bigint) : undefined
+    if (allowanceBn !== undefined && allowanceBn < depositAmount) {
+      alert('Please approve USDC for the deposit router first (click Approve), then deposit.')
+      return
+    }
+
     try {
       setLoading(true)
       setCurrentTxType('deposit')
@@ -242,9 +312,7 @@ export default function KOLPage() {
       setDepositHash(null)
       resetWriteContract()
       
-      const depositAmount = parseUnits(amount, 6)
       const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600)
-
       const intent: DepositIntent = {
         user: address,
         vault: VAULT_ADDRESS as Address,
@@ -253,31 +321,39 @@ export default function KOLPage() {
         nonce: nonce,
         deadline: deadline,
       }
-
-      if (!DEPOSIT_ROUTER_ADDRESS || DEPOSIT_ROUTER_ADDRESS === '0x0000000000000000000000000000000000000000') {
-        alert('Contract address not configured. Please set NEXT_PUBLIC_DEPOSIT_ROUTER_ADDRESS in .env file and restart the frontend.')
-        setLoading(false)
-        setCurrentTxType(null)
-        return
-      }
-
       const signature = await signDepositIntent(intent, chainId, DEPOSIT_ROUTER_ADDRESS as Address)
+
+      const functionName = selectedVault.hasSettlement ? 'depositWithIntentRequest' : 'depositWithIntent'
+      const args = [
+        [intent.user, intent.vault, intent.asset, intent.amount, intent.nonce, intent.deadline],
+        signature as `0x${string}`,
+      ] as const
+
+      if (publicClient) {
+        try {
+          await publicClient.simulateContract({
+            address: DEPOSIT_ROUTER_ADDRESS as Address,
+            abi: DEPOSIT_ROUTER_ABI,
+            functionName,
+            args,
+            account: address,
+          })
+        } catch (simErr: unknown) {
+          const err = simErr as { shortMessage?: string; message?: string; details?: string; cause?: { message?: string } }
+          const msg = err?.shortMessage ?? err?.message ?? err?.details ?? err?.cause?.message ?? String(simErr)
+          console.error('Deposit simulation failed:', simErr)
+          alert(`Transaction would fail:\n\n${msg}\n\nCommon fixes: Approve router for USDC, use correct network, ensure Ethereum router is redeployed (depositWithIntentRequest).`)
+          setCurrentTxType(null)
+          setLoading(false)
+          return
+        }
+      }
 
       writeContract({
         address: DEPOSIT_ROUTER_ADDRESS as Address,
         abi: DEPOSIT_ROUTER_ABI,
-        functionName: 'depositWithIntent',
-        args: [
-          [
-            intent.user,
-            intent.vault,
-            intent.asset,
-            intent.amount,
-            intent.nonce,
-            intent.deadline
-          ],
-          signature as `0x${string}`
-        ],
+        functionName,
+        args,
       })
       
     } catch (error) {
@@ -365,7 +441,7 @@ export default function KOLPage() {
       }) as any
 
       if (currentAllowance < BigInt(depositRecord.amount)) {
-        alert(`Insufficient allowance. You need to approve ${formatUnits(BigInt(depositRecord.amount), 6)} USDC. Current allowance: ${formatUnits(currentAllowance, 6)} USDC`)
+        alert(`Insufficient allowance. You need to approve ${formatUnits(BigInt(depositRecord.amount), selectedVault.asset.decimals)} ${selectedVault.asset.symbol}. Current allowance: ${formatUnits(currentAllowance, selectedVault.asset.decimals)} ${selectedVault.asset.symbol}`)
         setLoading(false)
         setCurrentTxType(null)
         return
@@ -516,7 +592,7 @@ export default function KOLPage() {
       }
 
       const apiUrl = (process.env.NEXT_PUBLIC_INDEXER_API_URL || 'http://localhost:3001').replace(/\/$/, '')
-      const withdrawAmountUSDC = parseUnits(withdrawAmount, 6)
+      const withdrawAmountUSDC = parseUnits(withdrawAmount, selectedVault.asset.decimals)
       const sharesNeeded = (withdrawAmountUSDC * vault.totalSupply) / vault.totalAssets
       
       if (sharesNeeded > vaultShares) {
@@ -575,7 +651,7 @@ export default function KOLPage() {
       if (error.message && (error.message.includes('claimSharesAndRequestRedeem') || error.message.includes('revert'))) {
         try {
           const vault = await getVaultState(VAULT_ADDRESS as Address)
-          const withdrawAmountUSDC = parseUnits(withdrawAmount, 6)
+          const withdrawAmountUSDC = parseUnits(withdrawAmount, selectedVault.asset.decimals)
           const sharesNeeded = (withdrawAmountUSDC * vault.totalSupply) / vault.totalAssets
           
           writeContract({
@@ -638,9 +714,25 @@ export default function KOLPage() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
         <h1 className="text-3xl sm:text-4xl font-bold mb-6 sm:mb-8">KOL Landing Page</h1>
 
+        <VaultSelector 
+          selectedVaultId={selectedVaultId} 
+          onVaultChange={handleVaultChange}
+          showCombined={false}
+        />
+        {isConnected && chainId !== selectedVault.chainId && (
+          <div className="mb-6 p-4 bg-yellow-50 border-2 border-yellow-500 rounded">
+            <p className="font-semibold text-yellow-800">
+              ⚠️ Please switch to {selectedVault.chain} network to interact with {selectedVault.name}
+            </p>
+            <p className="text-sm text-yellow-700 mt-1">
+              Current network: {chainId === 43114 ? 'Avalanche' : chainId === 1 ? 'Ethereum' : `Chain ${chainId}`}
+            </p>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 sm:gap-8">
           <div className="border-2 border-black p-6 sm:p-8">
-            <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">Deposit USDC</h2>
+            <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">Deposit {selectedVault.asset.symbol}</h2>
             
             {vaultShares > BigInt(0) && (
               <div className="mb-4 p-3 bg-blue-50 border border-blue-300 rounded text-sm">
@@ -676,32 +768,32 @@ export default function KOLPage() {
 
               {allowance !== undefined && allowance !== null && amount && (
                 <div className={`text-sm p-3 border rounded ${
-                  (allowance as bigint) >= parseUnits(amount, 6) 
+                  (allowance as bigint) >= parseUnits(amount, selectedVault.asset.decimals) 
                     ? 'bg-green-50 border-green-300 text-green-800' 
                     : 'bg-gray-50 border-gray-300 text-gray-600'
                 }`}>
                   <p>
-                    Allowance: <span className="font-semibold">{formatUnits(allowance as bigint, 6)} USDC</span>
+                    Allowance: <span className="font-semibold">{formatUnits(allowance as bigint, selectedVault.asset.decimals)} {selectedVault.asset.symbol}</span>
                     {isApprovalConfirming && (
                       <span className="ml-2 text-xs">(Confirming...)</span>
                     )}
                   </p>
-                  {(allowance as bigint) < parseUnits(amount, 6) && !isApprovalConfirming && (
+                  {(allowance as bigint) < parseUnits(amount, selectedVault.asset.decimals) && !isApprovalConfirming && (
                     <p className="text-red-600 mt-1 text-xs">Insufficient allowance. Please approve first.</p>
                   )}
-                  {isApprovalSuccess && (allowance as bigint) < parseUnits(amount, 6) && (
+                  {isApprovalSuccess && (allowance as bigint) < parseUnits(amount, selectedVault.asset.decimals) && (
                     <p className="text-blue-600 mt-1 text-xs">Approval confirmed! Refreshing allowance...</p>
                   )}
                 </div>
               )}
 
-              {allowance !== undefined && allowance !== null && (allowance as bigint) < parseUnits(amount || '0', 6) && (
+              {allowance !== undefined && allowance !== null && (allowance as bigint) < parseUnits(amount || '0', selectedVault.asset.decimals) && (
                 <button
                   onClick={handleApprove}
                   disabled={loading || isPending || isApprovalConfirming || isApproving || !amount}
                   className="w-full bg-gray-800 text-white py-3 px-6 font-bold hover:bg-gray-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
                 >
-                  {isApprovalConfirming ? 'Confirming Approval...' : isApproving || isPending ? 'Approving...' : 'Approve USDC'}
+                  {isApprovalConfirming ? 'Confirming Approval...' : isApproving || isPending ? 'Approving...' : `Approve ${selectedVault.asset.symbol}`}
                 </button>
               )}
 
@@ -714,7 +806,7 @@ export default function KOLPage() {
 
               <button
                 onClick={handleDeposit}
-                disabled={loading || isPending || !amount || (allowance !== undefined && allowance !== null && (allowance as bigint) < parseUnits(amount, 6))}
+                disabled={loading || isPending || !amount || chainId !== selectedVault.chainId || (allowance !== undefined && allowance !== null && (allowance as bigint) < parseUnits(amount, selectedVault.asset.decimals))}
                 className="w-full bg-black text-white py-3 px-6 font-bold hover:bg-gray-800 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
               >
                 {loading || isPending ? 'Depositing...' : 'Deposit to Vault'}
@@ -729,7 +821,7 @@ export default function KOLPage() {
               {depositSuccess && (
                 <div className="p-4 bg-green-50 border-2 border-green-500 rounded">
                   <p className="font-semibold text-green-800">✅ Deposit Successful!</p>
-                  <p className="text-sm text-green-700 mt-1">Your USDC has been deposited to the vault.</p>
+                  <p className="text-sm text-green-700 mt-1">Your {selectedVault.asset.symbol} has been deposited to the vault.</p>
                   {depositHash && <p className="text-xs text-green-600 mt-2 break-all">Tx Hash: {depositHash}</p>}
                 </div>
               )}
@@ -737,16 +829,16 @@ export default function KOLPage() {
               {executeSuccess && (
                 <div className="p-4 bg-green-50 border-2 border-green-500 rounded">
                   <p className="font-semibold text-green-800">✅ Deposit Executed Successfully!</p>
-                  <p className="text-sm text-green-700 mt-1">Your USDC has been deposited to the vault.</p>
+                  <p className="text-sm text-green-700 mt-1">Your {selectedVault.asset.symbol} has been deposited to the vault.</p>
                   {executedHash && <p className="text-xs text-green-600 mt-1 break-all">Tx Hash: {executedHash}</p>}
-                  <p className="text-sm text-green-700 mt-2">Your USDC has been transferred to the vault.</p>
+                  <p className="text-sm text-green-700 mt-2">Your {selectedVault.asset.symbol} has been transferred to the vault.</p>
                 </div>
               )}
             </div>
           </div>
 
           <div className="border-2 border-black p-6 sm:p-8">
-            <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">Withdraw USDC</h2>
+            <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">Withdraw {selectedVault.asset.symbol}</h2>
             
             {vaultShares > BigInt(0) && (
               <div className="mb-4 p-3 bg-blue-50 border border-blue-300 rounded text-sm">
@@ -865,7 +957,7 @@ export default function KOLPage() {
                   <div key={intent.id || intent.intentHash} className="border border-gray-300 p-4 rounded">
                     <div className="flex justify-between items-start mb-3">
                       <div>
-                        <p className="text-sm font-semibold">Amount: {formatUnits(BigInt(intent.amount || '0'), 6)} USDC</p>
+                        <p className="text-sm font-semibold">Amount: {formatUnits(BigInt(intent.amount || '0'), selectedVault.asset.decimals)} {selectedVault.asset.symbol}</p>
                         <p className="text-xs text-gray-600 mt-1">Status: <span className="font-semibold text-yellow-600">{intent.status}</span></p>
                         <p className="text-xs text-gray-500 mt-1 break-all">Intent Hash: {intent.intentHash}</p>
                         <p className="text-xs text-gray-500 mt-1">Created: {new Date(intent.timestamp).toLocaleString()}</p>

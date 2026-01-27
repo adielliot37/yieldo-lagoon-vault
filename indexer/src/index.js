@@ -1,10 +1,12 @@
 import express from 'express';
 import { createPublicClient, http, parseAbiItem } from 'viem';
-import { avalanche } from 'viem/chains';
+import { avalanche, mainnet } from 'viem/chains';
 import { MongoClient } from 'mongodb';
 import cron from 'node-cron';
 import { Vault } from '@lagoon-protocol/v0-viem';
 import dotenv from 'dotenv';
+import { VAULTS_CONFIG, getVaultById } from './vaults-config.js';
+import { indexDepositRouterEventsForVault, indexVaultEventsForVault } from './vault-indexer.js';
 
 dotenv.config();
 
@@ -48,16 +50,24 @@ let colDeposits;
 let colWithdrawals;
 let colSnapshots;
 let colMeta;
-let colPendingYieldoWithdrawals; // Track withdrawals initiated from Yieldo frontend
+let colPendingYieldoWithdrawals;
 
-const client = createPublicClient({
-  chain: avalanche,
-  transport: http(process.env.AVALANCHE_RPC_URL || 'https://api.avax.network/ext/bc/C/rpc'),
-});
+const clients = {};
 
-const DEPOSIT_ROUTER_ADDRESS = process.env.DEPOSIT_ROUTER_ADDRESS;
-const VAULT_ADDRESS = process.env.LAGOON_VAULT_ADDRESS;
-const USDC_ADDRESS = process.env.USDC_ADDRESS || '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E';
+for (const vault of VAULTS_CONFIG) {
+  if (!clients[vault.chain]) {
+    const primaryRpc = vault.rpcUrls[0];
+    clients[vault.chain] = createPublicClient({
+      chain: vault.chain === 'ethereum' ? mainnet : avalanche,
+      transport: http(primaryRpc),
+    });
+    console.log(`[${vault.chain}] Using RPC: ${primaryRpc}`);
+  }
+}
+
+function getClientForVault(vaultConfig) {
+  return clients[vaultConfig.chain];
+}
 
 async function initDatabase() {
   if (!mongoClient) {
@@ -77,22 +87,28 @@ async function initDatabase() {
   try {
     await colDeposits.dropIndex('transaction_hash_1').catch(() => {});
     await colWithdrawals.dropIndex('transaction_hash_1').catch(() => {});
-  } catch (e) {
-    // Ignore errors if indexes don't exist
-  }
+  } catch (e) {}
 
-    await Promise.all([
-      colIntents.createIndex({ intent_hash: 1 }, { unique: true }),
-      colIntents.createIndex({ user_address: 1, created_at: -1 }),
-      colDeposits.createIndex({ user_address: 1, created_at: -1 }),
-      colDeposits.createIndex({ transaction_hash: 1 }, { unique: true }),
-      colWithdrawals.createIndex({ transaction_hash: 1 }, { unique: true }),
-      colWithdrawals.createIndex({ user_address: 1, created_at: -1 }),
-      colSnapshots.createIndex({ date: 1, vault_address: 1 }, { unique: true }),
-      colPendingYieldoWithdrawals.createIndex({ user_address: 1, created_at: -1 }),
-      colPendingYieldoWithdrawals.createIndex({ transaction_hash: 1 }, { unique: true }),
-      colPendingYieldoWithdrawals.createIndex({ created_at: 1 }, { expireAfterSeconds: 3600 }),
-    ]);
+  await Promise.all([
+    colIntents.createIndex({ intent_hash: 1, chain: 1, vault_id: 1 }, { unique: true }),
+    colIntents.createIndex({ user_address: 1, created_at: -1 }),
+    colIntents.createIndex({ chain: 1, vault_id: 1 }),
+    colDeposits.createIndex({ user_address: 1, created_at: -1 }),
+    colDeposits.createIndex({ transaction_hash: 1, chain: 1 }, { unique: true }),
+    colDeposits.createIndex({ chain: 1, vault_id: 1, created_at: -1 }),
+    colDeposits.createIndex({ chain: 1, vault_address: 1 }),
+    colDeposits.createIndex({ source: 1, chain: 1, vault_id: 1 }),
+    colWithdrawals.createIndex({ transaction_hash: 1, chain: 1 }, { unique: true }),
+    colWithdrawals.createIndex({ user_address: 1, created_at: -1 }),
+    colWithdrawals.createIndex({ chain: 1, vault_id: 1, created_at: -1 }),
+    colWithdrawals.createIndex({ chain: 1, vault_address: 1 }),
+    colWithdrawals.createIndex({ source: 1, chain: 1, vault_id: 1 }),
+    colSnapshots.createIndex({ date: 1, vault_id: 1, chain: 1 }, { unique: true }),
+    colSnapshots.createIndex({ chain: 1, vault_id: 1, date: -1 }),
+    colPendingYieldoWithdrawals.createIndex({ user_address: 1, created_at: -1 }),
+    colPendingYieldoWithdrawals.createIndex({ transaction_hash: 1, chain: 1 }, { unique: true }),
+    colPendingYieldoWithdrawals.createIndex({ created_at: 1 }, { expireAfterSeconds: 3600 }),
+  ]);
 
   console.log('MongoDB initialized');
 }
@@ -318,8 +334,6 @@ async function indexVaultEvents(fromBlock, toBlock) {
       );
     }
 
-    // Index RedeemRequested events
-    // Try ERC-7540 standard event first: RedeemRequest(address indexed controller, address indexed owner, uint256 indexed requestId, address sender, uint256 shares)
     let redeemRequestedLogs = [];
     try {
       redeemRequestedLogs = await client.getLogs({
@@ -334,11 +348,7 @@ async function indexVaultEvents(fromBlock, toBlock) {
     } catch (e) {
       console.log(`Error querying ERC-7540 RedeemRequest: ${e.message}`);
     }
-    
-    // ALWAYS try querying by topic hash as fallback (even if first query succeeded)
-    // ERC-7540 RedeemRequest topic[0] = keccak256("RedeemRequest(address,address,uint256,address,uint256)")
-    // This is 0x1fdc681a13d8c5da54e301c7ce6542dcde4581e4725043fdab2db12ddc574506
-    // This ensures we catch events even if the event signature parsing fails
+
     try {
       const topicHash = '0x1fdc681a13d8c5da54e301c7ce6542dcde4581e4725043fdab2db12ddc574506';
       const logsByTopic = await client.getLogs({
@@ -350,21 +360,12 @@ async function indexVaultEvents(fromBlock, toBlock) {
       
       if (logsByTopic.length > 0) {
         console.log(`Found ${logsByTopic.length} logs with RedeemRequest topic hash in blocks ${fromBlock}-${toBlock}, attempting to decode...`);
-        
-        // Get existing transaction hashes to avoid duplicates
         const existingTxHashes = new Set(redeemRequestedLogs.map(l => l.transactionHash));
-        
-        // Try to decode these logs manually
         for (const log of logsByTopic) {
-          // Skip if we already have this transaction from the first query
           if (existingTxHashes.has(log.transactionHash)) {
             continue;
           }
-          
-          // Validate log structure before decoding
-          // ERC-7540 RedeemRequest should have:
-          // - 4 topics: [eventSig, controller, owner, requestId]
-          // - Data: sender (32 bytes) + shares (32 bytes) = 64 bytes = 130 chars (with 0x prefix)
+
           if (log.topics.length !== 4) {
             console.log(`Skipping log ${log.transactionHash}: expected 4 topics, got ${log.topics.length}`);
             continue;
@@ -374,9 +375,8 @@ async function indexVaultEvents(fromBlock, toBlock) {
             console.log(`Skipping log ${log.transactionHash}: data too short (expected 130 chars, got ${log.data?.length || 0})`);
             continue;
           }
-          
+
           try {
-            // Decode manually: controller (topic[1]), owner (topic[2]), requestId (topic[3]), sender and shares in data
             if (!log.topics[1] || !log.topics[2] || !log.topics[3]) {
               throw new Error('Missing required topics');
             }
@@ -384,17 +384,12 @@ async function indexVaultEvents(fromBlock, toBlock) {
             const controller = '0x' + log.topics[1].slice(-40);
             const owner = '0x' + log.topics[2].slice(-40);
             const requestId = BigInt(log.topics[3]);
-            
-            // Decode data: sender (address, 32 bytes) + shares (uint256, 32 bytes)
-            // Data format: 0x + 24 bytes padding + 20 bytes address + 32 bytes shares = 66 + 64 = 130 chars
-            const sender = '0x' + log.data.slice(26, 66); // Skip 0x and padding, get address
+            const sender = '0x' + log.data.slice(26, 66);
             const sharesData = log.data.slice(66, 130);
             if (!sharesData || sharesData.length !== 64) {
               throw new Error(`Invalid shares data length: ${sharesData?.length || 0}`);
             }
             const shares = BigInt('0x' + sharesData);
-            
-            // Create a log-like object that matches our expected format
             const decodedLog = {
               ...log,
               args: {
@@ -461,9 +456,7 @@ async function indexVaultEvents(fromBlock, toBlock) {
           console.log(`  Uncaught log: tx=${log.transactionHash}, topics=${log.topics.length}, block=${log.blockNumber}`);
         });
       }
-    } catch (e) {
-      // Ignore errors in debug logging
-    }
+    } catch (e) {}
 
     for (const log of redeemRequestedLogs) {
       const { controller, owner, requestId, sender, shares } = log.args;
@@ -613,162 +606,187 @@ async function indexVaultEvents(fromBlock, toBlock) {
       toBlock,
     });
 
-    // These will be used in daily snapshots
   } catch (error) {
-    // Handle "block not accepted" errors - throw so main loop can handle it
     if (error.message && (error.message.includes('after last accepted block') || error.message.includes('requested from block'))) {
       const finalityError = new Error(`Block range ${fromBlock}-${toBlock} not yet finalized`);
       finalityError.name = 'BlockNotFinalizedError';
       throw finalityError;
     }
     console.error('Error indexing vault events:', error);
-    throw error; // Re-throw other errors
+    throw error;
   }
 }
 
 async function createDailySnapshot() {
-  if (!VAULT_ADDRESS) return;
+  const now = new Date();
+  const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
+  const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59));
+  const dateKey = startOfDay.toISOString().slice(0, 10);
+
+  const snapshotPromises = VAULTS_CONFIG.map(async (vaultConfig) => {
+    try {
+      const client = getClientForVault(vaultConfig);
+      const vault = await Vault.fetch(vaultConfig.address, client);
+      if (!vault) {
+        console.error(`[${vaultConfig.id}] Failed to fetch vault`);
+        return;
+      }
+
+      const yieldoDepositsToday = await colDeposits
+        .find({ 
+          vault_id: vaultConfig.id,
+          chain: vaultConfig.chain,
+          source: 'yieldo',
+          created_at: { $gte: startOfDay, $lte: endOfDay },
+          status: { $in: ['executed', 'settled', 'requested'] }
+        })
+        .toArray();
+      
+      const totalDeposits = yieldoDepositsToday.reduce(
+        (acc, d) => acc + BigInt(d.amount || '0'), 
+        0n
+      ).toString();
+
+      const yieldoWithdrawalsToday = await colWithdrawals
+        .find({ 
+          vault_id: vaultConfig.id,
+          chain: vaultConfig.chain,
+          source: 'yieldo',
+          created_at: { $gte: startOfDay, $lte: endOfDay },
+          status: { $in: ['pending', 'settled'] }
+        })
+        .toArray();
+      
+      let totalWithdrawals = 0n;
+      for (const w of yieldoWithdrawalsToday) {
+        if (w.assets) {
+          totalWithdrawals += BigInt(w.assets);
+        } else if (w.shares && vault.totalSupply > 0n) {
+          try {
+            const sharesBigInt = BigInt(w.shares);
+            const estimatedAssets = vault.convertToAssets(sharesBigInt);
+            totalWithdrawals += estimatedAssets;
+          } catch (error) {
+            console.error(`[${vaultConfig.id}] Error converting shares to assets for withdrawal ${w._id}:`, error);
+          }
+        }
+      }
+
+      const yieldoUsers = await colDeposits.distinct('user_address', {
+        vault_id: vaultConfig.id,
+        chain: vaultConfig.chain,
+        $or: [
+          { source: 'yieldo' },
+          { intent_hash: { $exists: true, $ne: null } }
+        ],
+        status: { $in: ['executed', 'settled', 'requested'] }
+      });
+
+      let yieldoAUM = 0n;
+      const erc4626Abi = [
+        {
+          inputs: [{ name: 'account', type: 'address' }],
+          name: 'balanceOf',
+          outputs: [{ name: '', type: 'uint256' }],
+          stateMutability: 'view',
+          type: 'function',
+        },
+      ];
+
+      for (const user of yieldoUsers) {
+        try {
+          const userShares = await client.readContract({
+            address: vaultConfig.address,
+            abi: erc4626Abi,
+            functionName: 'balanceOf',
+            args: [user],
+          });
+          
+          if (vault.totalSupply > 0n && userShares > 0n) {
+            const userAssets = vault.convertToAssets(userShares);
+            yieldoAUM += userAssets;
+          }
+        } catch (error) {
+          console.error(`[${vaultConfig.id}] Error fetching balance for user ${user}:`, error);
+        }
+      }
+
+      await colSnapshots.updateOne(
+        { date: dateKey, vault_id: vaultConfig.id, chain: vaultConfig.chain },
+        {
+          $set: {
+            date: dateKey,
+            vault_id: vaultConfig.id,
+            vault_address: vaultConfig.address,
+            vault_name: vaultConfig.name,
+            chain: vaultConfig.chain,
+            asset_symbol: vaultConfig.asset.symbol,
+            asset_decimals: vaultConfig.asset.decimals,
+            total_assets: yieldoAUM.toString(),
+            total_supply: vault.totalSupply?.toString() || '0',
+            total_deposits: totalDeposits,
+            total_withdrawals: totalWithdrawals.toString(),
+            deposit_epoch_id: vault.depositEpochId || 0,
+            redeem_epoch_id: vault.redeemEpochId || 0,
+            created_at: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+
+      const depositsFormatted = (BigInt(totalDeposits) / BigInt(10 ** vaultConfig.asset.decimals)).toString();
+      const withdrawalsFormatted = (totalWithdrawals / BigInt(10 ** vaultConfig.asset.decimals)).toString();
+      const aumFormatted = (yieldoAUM / BigInt(10 ** vaultConfig.asset.decimals)).toString();
+      console.log(`[${vaultConfig.id}] Daily snapshot created for ${dateKey}: deposits=${depositsFormatted} ${vaultConfig.asset.symbol}, withdrawals=${withdrawalsFormatted} ${vaultConfig.asset.symbol}, AUM=${aumFormatted} ${vaultConfig.asset.symbol}`);
+    } catch (error) {
+      console.error(`[${vaultConfig.id}] Error creating daily snapshot:`, error);
+    }
+  });
+
+  await Promise.allSettled(snapshotPromises);
 
   try {
-    const vault = await Vault.fetch(VAULT_ADDRESS, client);
-    if (!vault) {
-      console.error('Failed to fetch vault');
-      return;
-    }
-
-    const now = new Date();
-    const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
-    const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59));
-    const dateKey = startOfDay.toISOString().slice(0, 10);
-
-    const yieldoDepositsToday = await colDeposits
-      .find({ 
-        source: 'yieldo',
-        created_at: { $gte: startOfDay, $lte: endOfDay },
-        status: { $in: ['executed', 'settled'] }
-      })
-      .toArray();
+    const allSnapshots = await colSnapshots.find({ date: dateKey }).toArray();
+    let combinedAUM = 0n;
+    let combinedDeposits = 0n;
+    let combinedWithdrawals = 0n;
     
-    const totalDeposits = yieldoDepositsToday.reduce(
-      (acc, d) => acc + BigInt(d.amount || '0'), 
-      0n
-    ).toString();
-
-    const yieldoWithdrawalsToday = await colWithdrawals
-      .find({ 
-        source: 'yieldo',
-        created_at: { $gte: startOfDay, $lte: endOfDay },
-        status: { $in: ['pending', 'settled'] }
-      })
-      .toArray();
+    for (const snapshot of allSnapshots) {
+      combinedAUM += BigInt(snapshot.total_assets || '0');
+      combinedDeposits += BigInt(snapshot.total_deposits || '0');
+      combinedWithdrawals += BigInt(snapshot.total_withdrawals || '0');
+    }
     
-    let totalWithdrawals = 0n;
-    for (const w of yieldoWithdrawalsToday) {
-      if (w.assets) {
-        totalWithdrawals += BigInt(w.assets);
-      } else if (w.shares && vault.totalSupply > 0n) {
-        try {
-          const sharesBigInt = BigInt(w.shares);
-          const estimatedAssets = vault.convertToAssets(sharesBigInt);
-          totalWithdrawals += estimatedAssets;
-        } catch (error) {
-          console.error(`Error converting shares to assets for withdrawal ${w._id}:`, error);
-        }
-      }
-    }
-
-    // Calculate Yieldo's AUM by getting all Yieldo users' current share balances
-    const yieldoUsers = await colDeposits.distinct('user_address', {
-      $or: [
-        { source: 'yieldo' },
-        { intent_hash: { $exists: true, $ne: null } }
-      ],
-      status: { $in: ['executed', 'settled', 'requested'] }
-    });
-
-    let yieldoAUM = 0n;
-    const erc4626Abi = [
-      {
-        inputs: [{ name: 'account', type: 'address' }],
-        name: 'balanceOf',
-        outputs: [{ name: '', type: 'uint256' }],
-        stateMutability: 'view',
-        type: 'function',
-      },
-    ];
-
-    for (const user of yieldoUsers) {
-      try {
-        const userShares = await client.readContract({
-          address: VAULT_ADDRESS,
-          abi: erc4626Abi,
-          functionName: 'balanceOf',
-          args: [user],
-        });
-        
-        if (vault.totalSupply > 0n && userShares > 0n) {
-          const userAssets = vault.convertToAssets(userShares);
-          yieldoAUM += userAssets;
-        }
-      } catch (error) {
-        console.error(`Error fetching balance for user ${user}:`, error);
-      }
-    }
-
-    // Check if existing snapshot has incorrect AUM (matches entire vault AUM)
-    const existingSnapshot = await colSnapshots.findOne({ date: dateKey, vault_address: VAULT_ADDRESS });
-    if (existingSnapshot && existingSnapshot.total_assets) {
-      const existingAUM = BigInt(existingSnapshot.total_assets);
-      const vaultTotalAssets = vault.totalAssets || 0n;
-      // If existing AUM is very close to vault total (within 1%), it's likely incorrect
-      if (vaultTotalAssets > 0n && existingAUM > 0n) {
-        const ratio = Number(existingAUM) / Number(vaultTotalAssets);
-        if (ratio > 0.99) {
-          console.log(`⚠️  Detected incorrect AUM in snapshot for ${dateKey} (${existingAUM} vs vault total ${vaultTotalAssets}). Recalculating...`);
-        }
-      }
-    }
-
-    await colSnapshots.updateOne(
-      { date: dateKey, vault_address: VAULT_ADDRESS },
-      {
-        $set: {
-          date: dateKey,
-          vault_address: VAULT_ADDRESS,
-          total_assets: yieldoAUM.toString(), // Yieldo's AUM, not entire vault's AUM
-          total_supply: vault.totalSupply?.toString() || '0',
-          total_deposits: totalDeposits,
-          total_withdrawals: totalWithdrawals.toString(),
-          deposit_epoch_id: vault.depositEpochId || 0,
-          redeem_epoch_id: vault.redeemEpochId || 0,
-          created_at: new Date(),
-        },
-      },
-      { upsert: true }
-    );
-
-    const depositsFormatted = (BigInt(totalDeposits) / BigInt(1e6)).toString();
-    const withdrawalsFormatted = (totalWithdrawals / BigInt(1e6)).toString();
-    const aumFormatted = (yieldoAUM / BigInt(1e6)).toString();
-    console.log(`Daily snapshot created for ${dateKey} (Yieldo only): deposits=${depositsFormatted} USDC, withdrawals=${withdrawalsFormatted} USDC, AUM=${aumFormatted} USDC`);
+    console.log(`[Combined] Total AUM across all vaults for ${dateKey}: ${(combinedAUM / BigInt(1e6)).toString()} USDC`);
   } catch (error) {
-    console.error('Error creating daily snapshot:', error);
+    console.error('Error calculating combined AUM:', error);
   }
 }
 
-let lastProcessedBlock = null;
+const lastProcessedBlocks = {};
 
 async function startIndexing() {
   await initDatabase();
 
-  const meta = await colMeta.findOne({ _id: 'lastProcessedBlock' });
-  if (meta?.value) {
-    lastProcessedBlock = BigInt(meta.value);
-  } else {
-    lastProcessedBlock = (await client.getBlockNumber()) - 1000n;
+  for (const vault of VAULTS_CONFIG) {
+    const metaKey = `lastProcessedBlock_${vault.chain}`;
+    const meta = await colMeta.findOne({ _id: metaKey });
+    const client = getClientForVault(vault);
+    
+    if (meta?.value) {
+      lastProcessedBlocks[vault.chain] = BigInt(meta.value);
+    } else {
+      const latestBlock = await client.getBlockNumber();
+      lastProcessedBlocks[vault.chain] = latestBlock - 100n;
+      await colMeta.updateOne(
+        { _id: metaKey },
+        { $set: { value: lastProcessedBlocks[vault.chain].toString(), updated_at: new Date() } },
+        { upsert: true }
+      );
+    }
+    
+    console.log(`[${vault.chain}] Starting indexing from block ${lastProcessedBlocks[vault.chain]}`);
   }
-
-  console.log(`Starting indexing from block ${lastProcessedBlock}`);
 
   async function getSafeBlockNumber() {
     const latestBlock = await client.getBlockNumber();
@@ -792,59 +810,72 @@ async function startIndexing() {
 
   setInterval(async () => {
     try {
-      const latestBlock = await client.getBlockNumber();
-      const safeBlock = await getSafeBlockNumber();
-      const fromBlock = lastProcessedBlock + 1n;
-      const toBlock = safeBlock;
-
-      if (fromBlock <= toBlock) {
-        console.log(`Indexing blocks ${fromBlock} to ${toBlock} (latest: ${latestBlock}, safe: ${safeBlock})`);
-        
+      const indexingPromises = VAULTS_CONFIG.map(async (vault) => {
         try {
-          await indexDepositRouterEvents(fromBlock, toBlock);
-          await indexVaultEvents(fromBlock, toBlock);
-          
-          lastProcessedBlock = toBlock;
-          await colMeta.updateOne(
-            { _id: 'lastProcessedBlock' },
-            { $set: { value: lastProcessedBlock.toString(), updated_at: new Date() } },
-            { upsert: true }
-          );
-        } catch (indexError) {
-          if (indexError.name === 'BlockNotFinalizedError' || 
-              (indexError.message && (
-                indexError.message.includes('after last accepted block') || 
-                indexError.message.includes('requested from block') ||
-                indexError.message.includes('not yet finalized')
-              ))) {
-            return;
+          const client = getClientForVault(vault);
+          const latestBlock = await client.getBlockNumber();
+          const SAFETY_MARGIN = vault.safetyMargin || BigInt(process.env[`${vault.chain.toUpperCase()}_SAFETY_MARGIN`] || '5');
+          const safeBlock = latestBlock > SAFETY_MARGIN ? latestBlock - SAFETY_MARGIN : latestBlock;
+          const fromBlock = lastProcessedBlocks[vault.chain] + 1n;
+          const toBlock = safeBlock;
+
+          if (fromBlock <= toBlock) {
+            console.log(`[${vault.id}] Indexing blocks ${fromBlock} to ${toBlock} (latest: ${latestBlock}, safe: ${safeBlock})`);
+            
+            try {
+              if (vault.depositRouter) {
+                await indexDepositRouterEventsForVault(
+                  vault,
+                  client,
+                  colIntents,
+                  colDeposits,
+                  fromBlock,
+                  toBlock
+                );
+              }
+              await indexVaultEventsForVault(
+                vault,
+                client,
+                colDeposits,
+                colWithdrawals,
+                colPendingYieldoWithdrawals,
+                colIntents,
+                colMeta,
+                fromBlock,
+                toBlock
+              );
+              
+              lastProcessedBlocks[vault.chain] = toBlock;
+              const metaKey = `lastProcessedBlock_${vault.chain}`;
+              await colMeta.updateOne(
+                { _id: metaKey },
+                { $set: { value: lastProcessedBlocks[vault.chain].toString(), updated_at: new Date() } },
+                { upsert: true }
+              );
+            } catch (indexError) {
+              if (indexError.name === 'BlockNotFinalizedError' || 
+                  (indexError.message && (
+                    indexError.message.includes('after last accepted block') || 
+                    indexError.message.includes('requested from block') ||
+                    indexError.message.includes('not yet finalized')
+                  ))) {
+                return;
+              }
+              console.error(`[${vault.id}] Indexing error:`, indexError);
+              throw indexError;
+            }
           }
-          throw indexError;
+        } catch (error) {
+          console.error(`[${vault.id}] Error in indexing loop:`, error);
         }
-      }
+      });
 
-      const now = Date.now();
-      const lastGapCheck = await colMeta.findOne({ _id: 'lastGapCheck' });
-      const GAP_CHECK_INTERVAL = 5 * 60 * 1000;
+      await Promise.allSettled(indexingPromises);
 
-      if (!lastGapCheck || (now - lastGapCheck.value) > GAP_CHECK_INTERVAL) {
-        const checkFromBlock = lastProcessedBlock > 1000n ? lastProcessedBlock - 1000n : 0n;
-        const checkToBlock = lastProcessedBlock;
-        
-        if (checkFromBlock < lastProcessedBlock) {
-          console.log(`Checking for gaps between blocks ${checkFromBlock} and ${checkToBlock}`);
-        }
-
-        await colMeta.updateOne(
-          { _id: 'lastGapCheck' },
-          { $set: { value: now, updated_at: new Date() } },
-          { upsert: true }
-        );
-      }
     } catch (error) {
       console.error('Error in indexing loop:', error);
     }
-  }, 10000);
+  }, 5000);
 
   cron.schedule('0 0 * * *', createDailySnapshot);
   console.log('Daily snapshot scheduler started');
@@ -852,8 +883,12 @@ async function startIndexing() {
 
 app.get('/api/deposits', async (req, res) => {
   try {
-    const { user } = req.query;
-    const filter = user ? { user_address: user } : {};
+    const { user, vault_id, chain } = req.query;
+    const filter = {};
+    if (user) filter.user_address = user;
+    if (vault_id) filter.vault_id = vault_id;
+    if (chain) filter.chain = chain;
+    
     const docs = await colDeposits.find(filter).sort({ created_at: -1 }).limit(100).toArray();
 
     res.json(
@@ -861,6 +896,11 @@ app.get('/api/deposits', async (req, res) => {
         id: d._id?.toString(),
         user: d.user_address,
         vault: d.vault_address,
+        vault_id: d.vault_id,
+        vault_name: d.vault_name,
+        chain: d.chain,
+        asset_symbol: d.asset_symbol,
+        asset_decimals: d.asset_decimals,
         amount: d.amount,
         status: d.status,
         source: d.source || 'yieldo',
@@ -878,10 +918,58 @@ app.get('/api/deposits', async (req, res) => {
 
 app.get('/api/snapshots', async (req, res) => {
   try {
-    const docs = await colSnapshots.find({}).sort({ date: -1 }).limit(30).toArray();
+    const { vault_id, chain, combined } = req.query;
+    
+    let query = {};
+    if (vault_id) query.vault_id = vault_id;
+    if (chain) query.chain = chain;
+    
+    const docs = await colSnapshots.find(query).sort({ date: -1 }).limit(30).toArray();
+    
+    if (combined === 'true') {
+      const byDate = {};
+      for (const s of docs) {
+        if (!byDate[s.date]) {
+          byDate[s.date] = {
+            date: s.date,
+            total_assets: 0n,
+            total_deposits: 0n,
+            total_withdrawals: 0n,
+            vaults: [],
+          };
+        }
+        byDate[s.date].total_assets += BigInt(s.total_assets || '0');
+        byDate[s.date].total_deposits += BigInt(s.total_deposits || '0');
+        byDate[s.date].total_withdrawals += BigInt(s.total_withdrawals || '0');
+        byDate[s.date].vaults.push({
+          vault_id: s.vault_id,
+          vault_name: s.vault_name,
+          chain: s.chain,
+          asset_symbol: s.asset_symbol,
+        });
+      }
+      
+      return res.json(
+        Object.values(byDate).map((s) => ({
+          date: s.date,
+          total_assets: s.total_assets.toString(),
+          total_deposits: s.total_deposits.toString(),
+          total_withdrawals: s.total_withdrawals.toString(),
+          aum: s.total_assets.toString(),
+          totalDeposits: s.total_deposits.toString(),
+          totalWithdrawals: s.total_withdrawals.toString(),
+          vaults: s.vaults,
+        }))
+      );
+    }
+    
     res.json(
       docs.map((s) => ({
         date: s.date,
+        vault_id: s.vault_id,
+        vault_name: s.vault_name,
+        chain: s.chain,
+        asset_symbol: s.asset_symbol,
         total_assets: s.total_assets || '0',
         total_deposits: s.total_deposits || '0',
         total_withdrawals: s.total_withdrawals || '0',
@@ -901,8 +989,12 @@ app.get('/api/snapshots', async (req, res) => {
 
 app.get('/api/intents', async (req, res) => {
   try {
-    const { user } = req.query;
-    const filter = user ? { user_address: user } : {};
+    const { user, vault_id, chain } = req.query;
+    const filter = {};
+    if (user) filter.user_address = user;
+    if (vault_id) filter.vault_id = vault_id;
+    if (chain) filter.chain = chain;
+    
     const docs = await colIntents.find(filter).sort({ created_at: -1 }).limit(100).toArray();
     res.json(
       docs.map((i) => ({
@@ -910,6 +1002,8 @@ app.get('/api/intents', async (req, res) => {
         intentHash: i.intent_hash,
         user: i.user_address,
         vault: i.vault_address,
+        vault_id: i.vault_id,
+        chain: i.chain,
         asset: i.asset_address,
         amount: i.amount,
         nonce: i.nonce,
@@ -926,14 +1020,23 @@ app.get('/api/intents', async (req, res) => {
 
 app.get('/api/withdrawals', async (req, res) => {
   try {
-    const { user } = req.query;
-    const filter = user ? { user_address: user } : {};
+    const { user, vault_id, chain } = req.query;
+    const filter = {};
+    if (user) filter.user_address = user;
+    if (vault_id) filter.vault_id = vault_id;
+    if (chain) filter.chain = chain;
+    
     const docs = await colWithdrawals.find(filter).sort({ created_at: -1 }).limit(100).toArray();
     res.json(
       docs.map((w) => ({
         id: w._id?.toString(),
         user: w.user_address,
         vault: w.vault_address,
+        vault_id: w.vault_id,
+        vault_name: w.vault_name,
+        chain: w.chain,
+        asset_symbol: w.asset_symbol,
+        asset_decimals: w.asset_decimals,
         shares: w.shares,
         assets: w.assets,
         epochId: w.epoch_id ?? null,
@@ -947,6 +1050,171 @@ app.get('/api/withdrawals', async (req, res) => {
     );
   } catch (error) {
     console.error('Error fetching withdrawals:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/deposits/mark-yieldo', async (req, res) => {
+  try {
+    const { txHash, userAddress } = req.body;
+    
+    if (!txHash) {
+      return res.status(400).json({ error: 'txHash is required' });
+    }
+
+    console.log(`Marking deposit as Yieldo: ${txHash}`);
+
+    const result = await colDeposits.updateOne(
+      { transaction_hash: txHash },
+      { $set: { source: 'yieldo' } }
+    );
+
+    if (result.matchedCount > 0) {
+      console.log(`✅ Marked deposit as Yieldo: ${txHash}`);
+      return res.json({ 
+        success: true, 
+        message: 'Deposit marked as from Yieldo',
+        txHash,
+        matchedCount: result.matchedCount,
+        modifiedCount: result.modifiedCount
+      });
+    }
+
+    if (userAddress) {
+      const markerId = `pending_yieldo_deposit_${txHash}`;
+      await colMeta.updateOne(
+        { _id: markerId },
+        {
+          $set: {
+            transaction_hash: txHash,
+            user_address: userAddress,
+            created_at: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+      await colMeta.updateOne(
+        { _id: txHash },
+        {
+          $set: {
+            transaction_hash: txHash,
+            user_address: userAddress,
+            created_at: new Date(),
+            is_yieldo_deposit: true,
+          },
+        },
+        { upsert: true }
+      );
+      
+      console.log(`📝 Stored pending marker for deposit: ${txHash} (will be marked when indexed)`);
+      const existingResult = await colDeposits.updateOne(
+        { transaction_hash: txHash },
+        { $set: { source: 'yieldo' } }
+      );
+      
+      if (existingResult.matchedCount > 0) {
+        console.log(`✅ Also updated existing deposit record for ${txHash}`);
+        return res.json({ 
+          success: true, 
+          message: 'Deposit found and marked as Yieldo. Marker also stored for future indexing.',
+          txHash,
+          matchedCount: existingResult.matchedCount,
+          modifiedCount: existingResult.modifiedCount
+        });
+      }
+      
+      return res.json({ 
+        success: true, 
+        message: 'Deposit not indexed yet, but marker stored. It will be marked as Yieldo when indexed.',
+        txHash,
+        pending: true
+      });
+    }
+    
+    console.log(`⚠️  Deposit not found for txHash: ${txHash}`);
+    return res.status(404).json({ 
+      error: 'Deposit not found. It may not have been indexed yet. Please wait a few seconds and try again.',
+      txHash 
+    });
+  } catch (error) {
+    console.error('Error marking deposit:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/deposits/mark-yieldo-and-backfill', async (req, res) => {
+  try {
+    const { txHash, userAddress, blockNumber } = req.body;
+    
+    if (!txHash) {
+      return res.status(400).json({ error: 'txHash is required' });
+    }
+
+    const markResult = await colDeposits.updateOne(
+      { transaction_hash: txHash },
+      { $set: { source: 'yieldo' } }
+    );
+
+    if (userAddress) {
+      const markerId = `pending_yieldo_deposit_${txHash}`;
+      await colMeta.updateOne(
+        { _id: markerId },
+        {
+          $set: {
+            transaction_hash: txHash,
+            user_address: userAddress,
+            created_at: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+      await colMeta.updateOne(
+        { _id: txHash },
+        {
+          $set: {
+            transaction_hash: txHash,
+            user_address: userAddress,
+            created_at: new Date(),
+            is_yieldo_deposit: true,
+          },
+        },
+        { upsert: true }
+      );
+    }
+
+    if (blockNumber) {
+      const block = BigInt(blockNumber);
+      const existingDeposit = await colDeposits.findOne({ transaction_hash: txHash });
+      let vaultConfig = null;
+      if (existingDeposit && existingDeposit.vault_id) {
+        vaultConfig = getVaultById(existingDeposit.vault_id);
+      } else {
+        vaultConfig = VAULTS_CONFIG.find(v => v.chain === 'ethereum');
+      }
+      
+      if (vaultConfig) {
+        console.log(`Backfilling block ${block} for vault ${vaultConfig.id}`);
+        const client = getClientForVault(vaultConfig);
+        if (vaultConfig.depositRouter) {
+          await indexDepositRouterEventsForVault(vaultConfig, client, colIntents, colDeposits, block, block);
+        }
+        await indexVaultEventsForVault(vaultConfig, client, colDeposits, colWithdrawals, colPendingYieldoWithdrawals, colIntents, colMeta, block, block);
+        console.log(`✅ Completed backfill for block ${block}`);
+      } else {
+        console.warn(`Could not find vault config for backfilling block ${block}`);
+      }
+    }
+
+    return res.json({ 
+      success: true, 
+      message: 'Deposit marked as Yieldo' + (blockNumber ? ` and block ${blockNumber} backfilled` : ''),
+      txHash,
+      matchedCount: markResult.matchedCount,
+      modifiedCount: markResult.modifiedCount,
+      blockBackfilled: blockNumber || null
+    });
+  } catch (error) {
+    console.error('Error marking deposit and backfilling:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1012,149 +1280,162 @@ app.post('/api/withdrawals/mark-yieldo', async (req, res) => {
 
 app.get('/api/aum', async (req, res) => {
   try {
-    const { user } = req.query;
+    const { user, vault_id, chain, combined } = req.query;
     if (!user) {
       return res.status(400).json({ error: 'user query parameter is required' });
     }
 
-    const yieldoDeposits = await colDeposits
-      .find(        { 
-        user_address: user, 
-        $or: [
-          { source: 'yieldo' },
-          { intent_hash: { $exists: true, $ne: null } }
-        ],
-        status: { $in: ['executed', 'settled', 'requested'] } 
-      })
-      .toArray();
-    
-    const totalDepositsYieldo = yieldoDeposits.reduce(
-      (acc, d) => acc + BigInt(d.amount || '0'),
-      0n
-    ).toString();
-
-    // Get vault to convert shares to assets for pending withdrawals
-    let vault = null;
-    try {
-      if (VAULT_ADDRESS) {
-        vault = await Vault.fetch(VAULT_ADDRESS, client);
-      }
-    } catch (error) {
-      console.error('Error fetching vault for withdrawal calculation:', error);
+    const depositFilter = {
+      user_address: user,
+      $or: [
+        { source: 'yieldo' },
+        { intent_hash: { $exists: true, $ne: null } }
+      ],
+      status: { $in: ['executed', 'settled', 'requested'] }
+    };
+    if (vault_id) {
+      depositFilter.vault_id = vault_id;
     }
-    
-    // Get all withdrawals from Yieldo for this user
-    const yieldoWithdrawals = await colWithdrawals
-      .find({ user_address: user, source: 'yieldo', status: { $in: ['pending', 'settled'] } })
-      .toArray();
-    
-    const totalWithdrawalsYieldo = yieldoWithdrawals.reduce(
-      (acc, w) => {
-        if (w.assets) {
-          return acc + BigInt(w.assets);
+    if (chain) {
+      depositFilter.chain = chain;
+    }
+
+    const withdrawalFilter = {
+      user_address: user,
+      source: 'yieldo',
+      status: { $in: ['pending', 'settled'] }
+    };
+    if (vault_id) {
+      withdrawalFilter.vault_id = vault_id;
+    }
+    if (chain) {
+      withdrawalFilter.chain = chain;
+    }
+
+    const allDepositsFilter = combined === 'true' 
+      ? {
+          user_address: user,
+          $or: [
+            { source: 'yieldo' },
+            { intent_hash: { $exists: true, $ne: null } }
+          ],
+          status: { $in: ['executed', 'settled', 'requested'] }
         }
-        if (w.shares && vault && vault.totalSupply > 0n) {
+      : depositFilter;
+    
+    const allWithdrawalsFilter = combined === 'true'
+      ? {
+          user_address: user,
+          source: 'yieldo',
+          status: { $in: ['pending', 'settled'] }
+        }
+      : withdrawalFilter;
+    
+    const yieldoDeposits = await colDeposits.find(allDepositsFilter).toArray();
+    const yieldoWithdrawals = await colWithdrawals.find(allWithdrawalsFilter).toArray();
+    const vaultsToProcess = combined === 'true' 
+      ? VAULTS_CONFIG 
+      : vault_id ? [{ id: vault_id, chain: chain }] : VAULTS_CONFIG;
+    
+    let totalAUM = 0n;
+    let totalDepositsYieldo = 0n;
+    let totalWithdrawalsYieldo = 0n;
+    const vaultBreakdown = [];
+    const erc4626Abi = [
+      {
+        inputs: [{ name: 'account', type: 'address' }],
+        name: 'balanceOf',
+        outputs: [{ name: '', type: 'uint256' }],
+        stateMutability: 'view',
+        type: 'function',
+      },
+    ];
+
+    for (const vaultInfo of vaultsToProcess) {
+      const vaultConfig = vaultInfo.id ? getVaultById(vaultInfo.id) : vaultInfo;
+      if (!vaultConfig) continue;
+      const vaultDeposits = yieldoDeposits.filter(d => 
+        d.vault_id && d.chain && d.vault_id === vaultConfig.id && d.chain === vaultConfig.chain
+      );
+      const vaultWithdrawals = yieldoWithdrawals.filter(w => 
+        w.vault_id && w.chain && w.vault_id === vaultConfig.id && w.chain === vaultConfig.chain
+      );
+      
+      const vaultDepositsAmount = vaultDeposits.reduce(
+        (acc, d) => acc + BigInt(d.amount || '0'),
+        0n
+      );
+      
+      const client = getClientForVault(vaultConfig);
+      let vault = null;
+      try {
+        vault = await Vault.fetch(vaultConfig.address, client);
+      } catch (error) {
+        console.error(`Error fetching vault ${vaultConfig.id}:`, error);
+        continue;
+      }
+
+      let vaultWithdrawalsAmount = 0n;
+      for (const w of vaultWithdrawals) {
+        if (w.assets) {
+          vaultWithdrawalsAmount += BigInt(w.assets);
+        } else if (w.shares && vault && vault.totalSupply > 0n) {
           try {
             const sharesBigInt = BigInt(w.shares);
             const estimatedAssets = vault.convertToAssets(sharesBigInt);
-            return acc + estimatedAssets;
+            vaultWithdrawalsAmount += estimatedAssets;
           } catch (error) {
-            console.error(`Error converting shares to assets for withdrawal ${w._id}:`, error);
-            return acc;
-          }
-        }
-        return acc;
-      },
-      0n
-    ).toString();
-
-    const lagoonWithdrawals = await colWithdrawals
-      .find({ user_address: user, source: 'lagoon', status: { $in: ['pending', 'settled'] } })
-      .toArray();
-    
-    const totalWithdrawalsLagoon = lagoonWithdrawals.reduce(
-      (acc, w) => {
-        if (w.assets) {
-          return acc + BigInt(w.assets);
-        }
-        if (w.shares && vault && vault.totalSupply > 0n) {
-          try {
-            const sharesBigInt = BigInt(w.shares);
-            const estimatedAssets = vault.convertToAssets(sharesBigInt);
-            return acc + estimatedAssets;
-          } catch (error) {
-            console.error(`Error converting shares to assets for withdrawal ${w._id}:`, error);
-            return acc;
-          }
-        }
-        return acc;
-      },
-      0n
-    ).toString();
-
-    const aumFromYieldo = (BigInt(totalDepositsYieldo) - BigInt(totalWithdrawalsYieldo)).toString();
-
-    let currentVaultBalance = '0';
-    try {
-      if (VAULT_ADDRESS) {
-        const vault = await Vault.fetch(VAULT_ADDRESS, client);
-        if (vault) {
-          const erc4626Abi = [
-            {
-              inputs: [{ name: 'account', type: 'address' }],
-              name: 'balanceOf',
-              outputs: [{ name: '', type: 'uint256' }],
-              stateMutability: 'view',
-              type: 'function',
-            },
-          ];
-          const userShares = await client.readContract({
-            address: VAULT_ADDRESS,
-            abi: erc4626Abi,
-            functionName: 'balanceOf',
-            args: [user],
-          });
-          
-          if (vault.totalSupply > 0n && userShares > 0n) {
-            currentVaultBalance = vault.convertToAssets(userShares).toString();
+            console.error(`Error converting shares for withdrawal ${w._id}:`, error);
           }
         }
       }
-    } catch (error) {
-      console.error('Error fetching vault balance:', error);
-    }
 
-    const vaultBalanceBigInt = BigInt(currentVaultBalance);
-    const depositsBigInt = BigInt(totalDepositsYieldo);
-    const withdrawalsBigInt = BigInt(totalWithdrawalsYieldo);
-    
-    const theoreticalAUM = depositsBigInt - withdrawalsBigInt;
-    
-    const actualAUM = theoreticalAUM > vaultBalanceBigInt 
-      ? vaultBalanceBigInt.toString() 
-      : theoreticalAUM.toString();
-    
-    let hasDirectWithdrawals = false;
-    let directWithdrawalAmount = '0';
-    
-    if (vaultBalanceBigInt < theoreticalAUM) {
-      hasDirectWithdrawals = true;
-      directWithdrawalAmount = (theoreticalAUM - vaultBalanceBigInt).toString();
+      let vaultUserBalance = 0n;
+      try {
+        const userShares = await client.readContract({
+          address: vaultConfig.address,
+          abi: erc4626Abi,
+          functionName: 'balanceOf',
+          args: [user],
+        });
+        
+        if (vault.totalSupply > 0n && userShares > 0n) {
+          vaultUserBalance = vault.convertToAssets(userShares);
+        }
+      } catch (error) {
+        console.error(`Error fetching user balance in vault ${vaultConfig.id}:`, error);
+      }
+      
+      const theoreticalAUM = vaultDepositsAmount - vaultWithdrawalsAmount;
+      const actualVaultAUM = theoreticalAUM > vaultUserBalance 
+        ? vaultUserBalance 
+        : theoreticalAUM;
+      
+      totalAUM += actualVaultAUM;
+      totalDepositsYieldo += vaultDepositsAmount;
+      totalWithdrawalsYieldo += vaultWithdrawalsAmount;
+      
+      vaultBreakdown.push({
+        vault_id: vaultConfig.id,
+        vault_name: vaultConfig.name,
+        chain: vaultConfig.chain,
+        asset_symbol: vaultConfig.asset.symbol,
+        aum: actualVaultAUM.toString(),
+        deposits: vaultDepositsAmount.toString(),
+        withdrawals: vaultWithdrawalsAmount.toString(),
+      });
     }
 
     res.json({
       user,
-      totalDepositsYieldo,
-      totalWithdrawalsYieldo,
-      totalWithdrawalsLagoon,
-      aumFromYieldo: actualAUM,
-      currentVaultBalance,
-      hasDirectWithdrawals,
-      directWithdrawalAmount,
+      totalDepositsYieldo: totalDepositsYieldo.toString(),
+      totalWithdrawalsYieldo: totalWithdrawalsYieldo.toString(),
+      aumFromYieldo: totalAUM.toString(),
+      combined: combined === 'true',
+      vaultBreakdown,
       breakdown: {
         deposits: yieldoDeposits.length,
         withdrawalsYieldo: yieldoWithdrawals.length,
-        withdrawalsLagoon: lagoonWithdrawals.length,
       },
     });
   } catch (error) {
@@ -1164,41 +1445,61 @@ app.get('/api/aum', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', lastBlock: lastProcessedBlock?.toString() });
+  const blocks = {};
+  for (const [chain, block] of Object.entries(lastProcessedBlocks)) {
+    blocks[chain] = block?.toString();
+  }
+  res.json({ status: 'ok', lastProcessedBlocks: blocks });
 });
 
-// Debug endpoint to check what events were emitted in a transaction
 app.get('/api/debug/tx', async (req, res) => {
   try {
-    const { txHash } = req.query;
+    const { txHash, chain } = req.query;
     
     if (!txHash) {
       return res.status(400).json({ error: 'txHash query parameter is required' });
     }
-
-    // Get transaction receipt to see all events
-    const receipt = await client.getTransactionReceipt({ hash: txHash });
     
+    if (!chain) {
+      return res.status(400).json({ error: 'chain query parameter is required (avalanche or ethereum)' });
+    }
+
+    const client = clients[chain];
+    if (!client) {
+      return res.status(400).json({ error: `Invalid chain: ${chain}` });
+    }
+
+    const receipt = await client.getTransactionReceipt({ hash: txHash });
     if (!receipt) {
       return res.status(404).json({ error: 'Transaction not found' });
     }
 
-    // Get all logs from this transaction
     const allLogs = receipt.logs || [];
+    const vaultConfig = VAULTS_CONFIG.find(v => 
+      allLogs.some(log => log.address.toLowerCase() === v.address.toLowerCase())
+    );
     
-    // Filter logs from the vault address
+    if (!vaultConfig) {
+      return res.json({
+        txHash,
+        blockNumber: receipt.blockNumber.toString(),
+        status: receipt.status,
+        from: receipt.from,
+        to: receipt.to,
+        message: 'No known vault address found in transaction logs',
+        totalLogs: allLogs.length,
+      });
+    }
+    
     const vaultLogs = allLogs.filter(log => 
-      log.address.toLowerCase() === VAULT_ADDRESS?.toLowerCase()
+      log.address.toLowerCase() === vaultConfig.address.toLowerCase()
     );
 
-    // Try to decode known events
     const decodedEvents = [];
     for (const log of vaultLogs) {
       try {
-        // Try to decode as RedeemRequested
         try {
           const decoded = parseAbiItem('event RedeemRequested(address indexed user, uint256 indexed epochId, uint256 shares)');
-          // This is simplified - in production you'd use proper decoding
           decodedEvents.push({
             address: log.address,
             topics: log.topics,
@@ -1232,7 +1533,9 @@ app.get('/api/debug/tx', async (req, res) => {
       status: receipt.status,
       from: receipt.from,
       to: receipt.to,
-      vaultAddress: VAULT_ADDRESS,
+      vaultAddress: vaultConfig?.address,
+      vaultId: vaultConfig?.id,
+      chain: chain,
       totalLogs: allLogs.length,
       vaultLogs: vaultLogs.length,
       events: decodedEvents,
@@ -1248,7 +1551,6 @@ app.get('/api/debug/tx', async (req, res) => {
   }
 });
 
-// Debug endpoint to check all events from vault in a block range
 app.get('/api/debug/events', async (req, res) => {
   try {
     const { fromBlock, toBlock } = req.query;
@@ -1260,7 +1562,6 @@ app.get('/api/debug/events', async (req, res) => {
     const from = BigInt(fromBlock);
     const to = BigInt(toBlock);
 
-    // Get ALL logs from the vault (no event filter)
     const allLogs = await client.getLogs({
       address: VAULT_ADDRESS,
       fromBlock: from,
@@ -1286,7 +1587,6 @@ app.get('/api/debug/events', async (req, res) => {
   }
 });
 
-// Backfill endpoint to re-index specific block ranges
 app.post('/api/backfill', async (req, res) => {
   try {
     const { fromBlock, toBlock } = req.body;
@@ -1315,7 +1615,6 @@ app.post('/api/backfill', async (req, res) => {
         toBlock: to.toString()
       });
     } catch (backfillError) {
-      // If it's a finality error, still return success but with a warning
       if (backfillError.name === 'BlockNotFinalizedError' || 
           (backfillError.message && backfillError.message.includes('not yet finalized'))) {
         res.status(202).json({ 
@@ -1335,7 +1634,6 @@ app.post('/api/backfill', async (req, res) => {
   }
 });
 
-// Endpoint to backfill a single block
 app.post('/api/backfill/block', async (req, res) => {
   try {
     const { blockNumber } = req.body;
@@ -1345,19 +1643,46 @@ app.post('/api/backfill/block', async (req, res) => {
     }
 
     const block = BigInt(blockNumber);
-    console.log(`Manual backfill requested for block ${block}`);
+    const { vault_id, chain } = req.body;
+    
+    console.log(`Manual backfill requested for block ${block}${vault_id ? ` (vault: ${vault_id})` : ''}`);
     
     try {
-      await indexDepositRouterEvents(block, block);
-      await indexVaultEvents(block, block);
-      
-      res.json({ 
-        success: true, 
-        message: `Backfilled block ${block}`,
-        blockNumber: block.toString()
-      });
+      if (vault_id && chain) {
+        const vaultConfig = getVaultById(vault_id);
+        if (!vaultConfig || vaultConfig.chain !== chain) {
+          return res.status(400).json({ error: 'Invalid vault_id or chain' });
+        }
+        
+        const client = getClientForVault(vaultConfig);
+        if (vaultConfig.depositRouter) {
+          await indexDepositRouterEventsForVault(vaultConfig, client, colIntents, colDeposits, block, block);
+        }
+        await indexVaultEventsForVault(vaultConfig, client, colDeposits, colWithdrawals, colPendingYieldoWithdrawals, colIntents, colMeta, block, block);
+        
+        res.json({ 
+          success: true, 
+          message: `Backfilled block ${block} for vault ${vault_id}`,
+          blockNumber: block.toString(),
+          vault_id: vault_id,
+          chain: chain
+        });
+      } else {
+        for (const vaultConfig of VAULTS_CONFIG) {
+          const client = getClientForVault(vaultConfig);
+          if (vaultConfig.depositRouter) {
+            await indexDepositRouterEventsForVault(vaultConfig, client, colIntents, colDeposits, block, block);
+          }
+          await indexVaultEventsForVault(vaultConfig, client, colDeposits, colWithdrawals, colPendingYieldoWithdrawals, colIntents, colMeta, block, block);
+        }
+        
+        res.json({ 
+          success: true, 
+          message: `Backfilled block ${block} for all vaults`,
+          blockNumber: block.toString()
+        });
+      }
     } catch (backfillError) {
-      // If it's a finality error, still return success but with a warning
       if (backfillError.name === 'BlockNotFinalizedError' || 
           (backfillError.message && backfillError.message.includes('not yet finalized'))) {
         res.status(202).json({ 
@@ -1376,7 +1701,71 @@ app.post('/api/backfill/block', async (req, res) => {
   }
 });
 
-// Endpoint to delete a specific snapshot
+app.get('/api/backfill/block', async (req, res) => {
+  try {
+    const { blockNumber, vault_id, chain } = req.query;
+    
+    if (!blockNumber) {
+      return res.status(400).json({ error: 'blockNumber query parameter is required' });
+    }
+
+    const block = BigInt(blockNumber);
+    console.log(`Manual backfill requested for block ${block}${vault_id ? ` (vault: ${vault_id})` : ''}`);
+    
+    try {
+      if (vault_id && chain) {
+        const vaultConfig = getVaultById(vault_id);
+        if (!vaultConfig || vaultConfig.chain !== chain) {
+          return res.status(400).json({ error: 'Invalid vault_id or chain' });
+        }
+        
+        const client = getClientForVault(vaultConfig);
+        if (vaultConfig.depositRouter) {
+          await indexDepositRouterEventsForVault(vaultConfig, client, colIntents, colDeposits, block, block);
+        }
+        await indexVaultEventsForVault(vaultConfig, client, colDeposits, colWithdrawals, colPendingYieldoWithdrawals, colIntents, colMeta, block, block);
+        
+        res.json({ 
+          success: true, 
+          message: `Backfilled block ${block} for vault ${vault_id}`,
+          blockNumber: block.toString(),
+          vault_id: vault_id,
+          chain: chain
+        });
+      } else {
+        for (const vaultConfig of VAULTS_CONFIG) {
+          const client = getClientForVault(vaultConfig);
+          if (vaultConfig.depositRouter) {
+            await indexDepositRouterEventsForVault(vaultConfig, client, colIntents, colDeposits, block, block);
+          }
+          await indexVaultEventsForVault(vaultConfig, client, colDeposits, colWithdrawals, colPendingYieldoWithdrawals, colIntents, colMeta, block, block);
+        }
+        
+        res.json({ 
+          success: true, 
+          message: `Backfilled block ${block} for all vaults`,
+          blockNumber: block.toString()
+        });
+      }
+    } catch (backfillError) {
+      if (backfillError.name === 'BlockNotFinalizedError' || 
+          (backfillError.message && backfillError.message.includes('not yet finalized'))) {
+        res.status(202).json({ 
+          success: true, 
+          warning: 'Block may not be finalized yet',
+          message: `Attempted to backfill block ${block}`,
+          blockNumber: block.toString()
+        });
+      } else {
+        throw backfillError;
+      }
+    }
+  } catch (error) {
+    console.error('Error in block backfill:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.delete('/api/snapshots/:date', async (req, res) => {
   try {
     const { date } = req.params;
@@ -1385,8 +1774,7 @@ app.delete('/api/snapshots/:date', async (req, res) => {
     }
 
     const result = await colSnapshots.deleteOne({
-      date: date,
-      vault_address: VAULT_ADDRESS
+      date: date
     });
 
     if (result.deletedCount === 0) {
@@ -1404,87 +1792,108 @@ app.delete('/api/snapshots/:date', async (req, res) => {
   }
 });
 
-// Endpoint to recalculate AUM for all existing snapshots
 app.post('/api/snapshots/recalculate-aum', async (req, res) => {
   try {
-    if (!VAULT_ADDRESS) {
-      return res.status(400).json({ error: 'VAULT_ADDRESS not configured' });
-    }
+    let totalYieldoAUM = 0n;
+    const vaultResults = [];
 
-    const vault = await Vault.fetch(VAULT_ADDRESS, client);
-    if (!vault) {
-      return res.status(500).json({ error: 'Failed to fetch vault' });
-    }
-
-    // Get all Yieldo users
-    const yieldoUsers = await colDeposits.distinct('user_address', {
-      $or: [
-        { source: 'yieldo' },
-        { intent_hash: { $exists: true, $ne: null } }
-      ],
-      status: { $in: ['executed', 'settled', 'requested'] }
-    });
-
-    // Calculate current Yieldo AUM
-    let yieldoAUM = 0n;
-    const erc4626Abi = [
-      {
-        inputs: [{ name: 'account', type: 'address' }],
-        name: 'balanceOf',
-        outputs: [{ name: '', type: 'uint256' }],
-        stateMutability: 'view',
-        type: 'function',
-      },
-    ];
-
-    console.log(`Recalculating Yieldo AUM from ${yieldoUsers.length} users...`);
-    for (const user of yieldoUsers) {
+    for (const vaultConfig of VAULTS_CONFIG) {
       try {
-        const userShares = await client.readContract({
-          address: VAULT_ADDRESS,
-          abi: erc4626Abi,
-          functionName: 'balanceOf',
-          args: [user],
-        });
-        
-        if (vault.totalSupply > 0n && userShares > 0n) {
-          const userAssets = vault.convertToAssets(userShares);
-          yieldoAUM += userAssets;
+        const client = getClientForVault(vaultConfig);
+        const vault = await Vault.fetch(vaultConfig.address, client);
+        if (!vault) {
+          console.error(`[${vaultConfig.id}] Failed to fetch vault`);
+          continue;
         }
+
+        const yieldoUsers = await colDeposits.distinct('user_address', {
+          vault_id: vaultConfig.id,
+          chain: vaultConfig.chain,
+          $or: [
+            { source: 'yieldo' },
+            { intent_hash: { $exists: true, $ne: null } }
+          ],
+          status: { $in: ['executed', 'settled', 'requested'] }
+        });
+
+        let vaultYieldoAUM = 0n;
+        const erc4626Abi = [
+          {
+            inputs: [{ name: 'account', type: 'address' }],
+            name: 'balanceOf',
+            outputs: [{ name: '', type: 'uint256' }],
+            stateMutability: 'view',
+            type: 'function',
+          },
+        ];
+
+        console.log(`[${vaultConfig.id}] Recalculating Yieldo AUM from ${yieldoUsers.length} users...`);
+        for (const user of yieldoUsers) {
+          try {
+            const userShares = await client.readContract({
+              address: vaultConfig.address,
+              abi: erc4626Abi,
+              functionName: 'balanceOf',
+              args: [user],
+            });
+            
+            if (vault.totalSupply > 0n && userShares > 0n) {
+              const userAssets = vault.convertToAssets(userShares);
+              vaultYieldoAUM += userAssets;
+            }
+          } catch (error) {
+            console.error(`[${vaultConfig.id}] Error fetching balance for user ${user}:`, error);
+          }
+        }
+        
+        totalYieldoAUM += vaultYieldoAUM;
+        vaultResults.push({
+          vault_id: vaultConfig.id,
+          vault_name: vaultConfig.name,
+          chain: vaultConfig.chain,
+          aum: vaultYieldoAUM.toString(),
+        });
       } catch (error) {
-        console.error(`Error fetching balance for user ${user}:`, error);
+        console.error(`[${vaultConfig.id}] Error processing vault:`, error);
       }
     }
 
-    // Get today's date to exclude it from recalculation (day is still running)
     const today = new Date();
     const todayKey = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 0, 0, 0))
       .toISOString().slice(0, 10);
 
-    // Update all snapshots EXCEPT today's (since the day is still running)
-    const result = await colSnapshots.updateMany(
-      { 
-        vault_address: VAULT_ADDRESS,
-        date: { $ne: todayKey } // Exclude today's snapshot
-      },
-      {
-        $set: {
-          total_assets: yieldoAUM.toString(),
-          updated_at: new Date(),
+    let totalUpdated = 0;
+    for (const vaultConfig of VAULTS_CONFIG) {
+      const vaultResult = vaultResults.find(r => r.vault_id === vaultConfig.id);
+      if (!vaultResult) continue;
+      
+      const result = await colSnapshots.updateMany(
+        { 
+          vault_id: vaultConfig.id,
+          chain: vaultConfig.chain,
+          date: { $ne: todayKey }
         },
-      }
-    );
+        {
+          $set: {
+            total_assets: vaultResult.aum,
+            updated_at: new Date(),
+          },
+        }
+      );
+      totalUpdated += result.modifiedCount;
+    }
 
-    const aumFormatted = (yieldoAUM / BigInt(1e6)).toString();
-    console.log(`Recalculated AUM for ${result.modifiedCount} past snapshots (excluding today ${todayKey}): ${aumFormatted} USDC`);
+    const aumFormatted = (totalYieldoAUM / BigInt(1e6)).toString();
+    console.log(`Recalculated AUM for ${totalUpdated} past snapshots (excluding today ${todayKey}): ${aumFormatted} USDC`);
 
     res.json({
       success: true,
-      message: `Recalculated AUM for ${result.modifiedCount} past snapshots (excluding today)`,
-      yieldoAUM: yieldoAUM.toString(),
-      yieldoAUMFormatted: aumFormatted,
-      snapshotsUpdated: result.modifiedCount,
+      message: `Recalculated AUM for ${totalUpdated} past snapshots (excluding today)`,
+      totalYieldoAUM: totalYieldoAUM.toString(),
+      totalYieldoAUMFormatted: aumFormatted,
+      snapshotsUpdated: totalUpdated,
       todayExcluded: todayKey,
+      vaultBreakdown: vaultResults,
     });
   } catch (error) {
     console.error('Error recalculating snapshots AUM:', error);

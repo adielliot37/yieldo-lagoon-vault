@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { WagmiProvider } from 'wagmi'
 import { RainbowKitProvider, getDefaultConfig } from '@rainbow-me/rainbowkit'
-import { avalanche } from 'wagmi/chains'
+import { avalanche, mainnet } from 'wagmi/chains'
 import '@rainbow-me/rainbowkit/styles.css'
 import { useState, useMemo } from 'react'
 
@@ -16,7 +16,7 @@ function getWagmiConfig() {
     wagmiConfigInstance = getDefaultConfig({
       appName: 'Yieldo',
       projectId,
-      chains: [avalanche],
+      chains: [avalanche, mainnet], // Support both Avalanche and Ethereum
       ssr: true,
     })
   }
