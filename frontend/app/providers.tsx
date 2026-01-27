@@ -19,7 +19,6 @@ const chains = [avalanche, mainnet] as const
 const { wallets } = getDefaultWallets({
   appName: 'Yieldo',
   projectId,
-  chains,
 })
 
 const connectors = connectorsForWallets(wallets, {
