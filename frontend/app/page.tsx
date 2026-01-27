@@ -2,6 +2,7 @@
 
 import { ConnectButton } from '@rainbow-me/rainbowkit'
 import Link from 'next/link'
+import { VAULTS_CONFIG } from '@/lib/vaults-config'
 
 export default function Home() {
   return (
@@ -35,7 +36,7 @@ export default function Home() {
           <h3 className="text-xl font-bold mb-4">Features</h3>
           <ul className="space-y-2 text-gray-700">
             <li>• EIP-712 intent verification for deposits</li>
-            <li>• Async vault support (Lagoon on Avalanche)</li>
+            <li>• Async vault support (Lagoon on Avalanche & Ethereum)</li>
             <li>• Real-time event indexing</li>
             <li>• Daily deterministic snapshots</li>
             <li>• USDC deposits only</li>
@@ -43,21 +44,31 @@ export default function Home() {
         </div>
 
         <div className="border-t border-black pt-8 mt-8">
-          <h3 className="text-xl font-bold mb-4">Integrated Vault</h3>
-          <div className="bg-gray-50 border border-black p-4">
-            <p className="font-semibold text-lg mb-2">Turtle Avalanche USDC</p>
-            <p className="text-sm text-gray-600 mb-2">Lagoon Vault on Avalanche</p>
-            <p className="text-xs text-gray-500 break-all">
-              Address: 0x3048925b3ea5a8c12eecccb8810f5f7544db54af
-            </p>
-            <a 
-              href="https://snowtrace.io/address/0x3048925b3ea5a8c12eecccb8810f5f7544db54af"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-sm text-blue-600 hover:underline mt-2 inline-block"
-            >
-              View on Snowtrace →
-            </a>
+          <h3 className="text-xl font-bold mb-4">Integrated Vaults</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {VAULTS_CONFIG.map((vault) => {
+              const explorerUrl = vault.chain === 'ethereum'
+                ? `https://etherscan.io/address/${vault.address}`
+                : `https://snowtrace.io/address/${vault.address}`
+              const explorerName = vault.chain === 'ethereum' ? 'Etherscan' : 'Snowtrace'
+              return (
+                <div key={vault.id} className="bg-gray-50 border border-black p-4">
+                  <p className="font-semibold text-lg mb-2">{vault.name}</p>
+                  <p className="text-sm text-gray-600 mb-2">Lagoon Vault on {vault.chain.charAt(0).toUpperCase() + vault.chain.slice(1)}</p>
+                  <p className="text-xs text-gray-500 break-all mb-2">
+                    Address: {vault.address}
+                  </p>
+                  <a 
+                    href={explorerUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sm text-blue-600 hover:underline inline-block"
+                  >
+                    View on {explorerName} →
+                  </a>
+                </div>
+              )
+            })}
           </div>
         </div>
       </div>

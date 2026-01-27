@@ -822,7 +822,19 @@ export default function KOLPage() {
                 <div className="p-4 bg-green-50 border-2 border-green-500 rounded">
                   <p className="font-semibold text-green-800">✅ Deposit Successful!</p>
                   <p className="text-sm text-green-700 mt-1">Your {selectedVault.asset.symbol} has been deposited to the vault.</p>
-                  {depositHash && <p className="text-xs text-green-600 mt-2 break-all">Tx Hash: {depositHash}</p>}
+                  {depositHash && (
+                    <>
+                      <p className="text-xs text-green-600 mt-2 break-all">Tx Hash: {depositHash}</p>
+                      <a
+                        href={selectedVault.chain === 'ethereum' ? `https://etherscan.io/tx/${depositHash}` : `https://snowtrace.io/tx/${depositHash}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-blue-600 hover:underline mt-1 inline-block"
+                      >
+                        View on {selectedVault.chain === 'ethereum' ? 'Etherscan' : 'Snowtrace'} →
+                      </a>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -830,7 +842,19 @@ export default function KOLPage() {
                 <div className="p-4 bg-green-50 border-2 border-green-500 rounded">
                   <p className="font-semibold text-green-800">✅ Deposit Executed Successfully!</p>
                   <p className="text-sm text-green-700 mt-1">Your {selectedVault.asset.symbol} has been deposited to the vault.</p>
-                  {executedHash && <p className="text-xs text-green-600 mt-1 break-all">Tx Hash: {executedHash}</p>}
+                  {executedHash && (
+                    <>
+                      <p className="text-xs text-green-600 mt-1 break-all">Tx Hash: {executedHash}</p>
+                      <a
+                        href={selectedVault.chain === 'ethereum' ? `https://etherscan.io/tx/${executedHash}` : `https://snowtrace.io/tx/${executedHash}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-blue-600 hover:underline mt-1 inline-block"
+                      >
+                        View on {selectedVault.chain === 'ethereum' ? 'Etherscan' : 'Snowtrace'} →
+                      </a>
+                    </>
+                  )}
                   <p className="text-sm text-green-700 mt-2">Your {selectedVault.asset.symbol} has been transferred to the vault.</p>
                 </div>
               )}
@@ -909,12 +933,12 @@ export default function KOLPage() {
                     <>
                       <p className="text-xs text-green-600 mt-2 break-all">Tx Hash: {withdrawHash}</p>
                       <a
-                        href={`https://snowtrace.io/tx/${withdrawHash}`}
+                        href={selectedVault.chain === 'ethereum' ? `https://etherscan.io/tx/${withdrawHash}` : `https://snowtrace.io/tx/${withdrawHash}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-xs text-blue-600 hover:underline mt-1 inline-block"
                       >
-                        View on Snowtrace →
+                        View on {selectedVault.chain === 'ethereum' ? 'Etherscan' : 'Snowtrace'} →
                       </a>
                     </>
                   )}
@@ -1079,12 +1103,12 @@ export default function KOLPage() {
 
                 <div className="pt-3 border-t border-gray-300">
                   <a 
-                    href={`https://snowtrace.io/address/${VAULT_ADDRESS}`}
+                    href={selectedVault.chain === 'ethereum' ? `https://etherscan.io/address/${VAULT_ADDRESS}` : `https://snowtrace.io/address/${VAULT_ADDRESS}`}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="inline-flex items-center text-sm text-blue-600 hover:text-blue-800 hover:underline transition-colors"
                   >
-                    View on Snowtrace →
+                    View on {selectedVault.chain === 'ethereum' ? 'Etherscan' : 'Snowtrace'} →
                   </a>
                 </div>
               </div>
