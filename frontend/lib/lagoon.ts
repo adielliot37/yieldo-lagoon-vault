@@ -11,7 +11,7 @@ const clients = {
   }),
   ethereum: createPublicClient({
     chain: mainnet,
-    transport: http(process.env.NEXT_PUBLIC_ETHEREUM_RPC_URL || 'https://eth.llamarpc.com'),
+    transport: http(process.env.NEXT_PUBLIC_ETHEREUM_RPC_URL || 'https://1rpc.io/eth'),
   }),
 }
 

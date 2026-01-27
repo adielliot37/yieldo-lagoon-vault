@@ -173,13 +173,24 @@ export default function KOLPage() {
 
   useEffect(() => {
     if (VAULT_ADDRESS && isConnected && chainId === selectedVault.chainId) {
+      // Clear previous vault's data before fetching new data
+      setVaultShares(BigInt(0))
+      setVaultState(null)
       fetchVaultState()
       fetchVaultShares()
+    } else {
+      // If not connected or wrong chain, clear data
+      setVaultShares(BigInt(0))
+      setVaultState(null)
     }
-  }, [VAULT_ADDRESS, isConnected, address, selectedVault, chainId])
+  }, [VAULT_ADDRESS, isConnected, address, selectedVaultId, chainId]) // Use selectedVaultId to ensure refetch on vault change
 
   const fetchVaultShares = async () => {
-    if (!address || !VAULT_ADDRESS || chainId !== selectedVault.chainId) return
+    if (!address || !VAULT_ADDRESS || chainId !== selectedVault.chainId) {
+      // If conditions not met, set to zero
+      setVaultShares(BigInt(0))
+      return
+    }
     
     try {
       const balance = await publicClient?.readContract({
@@ -189,11 +200,17 @@ export default function KOLPage() {
         args: [address],
       }) as bigint
       
-      if (balance !== undefined) {
+      // CRITICAL FIX: Only update if still on the same vault
+      if (balance !== undefined && selectedVaultId === selectedVault.id) {
         setVaultShares(balance)
+      } else {
+        // If vault changed during fetch, set to zero
+        setVaultShares(BigInt(0))
       }
     } catch (error) {
       console.error('Failed to fetch vault shares:', error)
+      // On error, set to zero (not previous vault's data)
+      setVaultShares(BigInt(0))
     }
   }
 
@@ -224,6 +241,13 @@ export default function KOLPage() {
     const vault = getVaultById(vaultId)
     if (!vault) return
     
+    // CRITICAL FIX: Clear previous vault's data immediately
+    setVaultShares(BigInt(0))
+    setVaultState(null)
+    setAmount('')
+    setWithdrawAmount('')
+    setPendingIntentHash(null)
+    
     setSelectedVaultId(vaultId)
     if (isConnected && chainId !== vault.chainId) {
       try {
@@ -233,9 +257,6 @@ export default function KOLPage() {
         alert(`Please switch to ${vault.chain} network to interact with this vault`)
       }
     }
-    setAmount('')
-    setVaultState(null)
-    setPendingIntentHash(null)
   }
 
   const handleApprove = async () => {
