@@ -2,7 +2,7 @@ export interface VaultConfig {
   id: string;
   name: string;
   address: string;
-  chain: 'avalanche' | 'ethereum' | 'polygon';
+  chain: 'avalanche' | 'ethereum';
   chainId: number;
   asset: {
     address: string;
