@@ -1,0 +1,17 @@
+{
+  "name": "yieldo-vault-kpi",
+  "version": "1.0.0",
+  "description": "Vault KPI & rating job for Yieldo (Capital, Performance, Risk)",
+  "type": "module",
+  "main": "src/run.js",
+  "scripts": {
+    "start": "node src/cli.js",
+    "run": "node src/cli.js"
+  },
+  "dependencies": {
+    "@lagoon-protocol/v0-viem": "^0.1.0",
+    "dotenv": "^16.3.1",
+    "mongodb": "^6.3.0",
+    "viem": "^2.0.0"
+  }
+}

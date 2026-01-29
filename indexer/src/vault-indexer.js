@@ -746,6 +746,141 @@ export async function indexVaultEventsForVault(
       );
     }
 
+    // ERC4626 Withdraw: user claimed assets after settlement -> mark withdrawal as withdrawn
+    const vaultAddrLower = vaultConfig.address.toLowerCase();
+    const WITHDRAW_TOPIC0 = '0xfbde797d201c681b91056529119e0b02407c7bb96a4a2c75c01fc9667232c8db'; // keccak256("Withdraw(address,address,address,uint256,uint256)")
+    let withdrawLogs = [];
+    try {
+      withdrawLogs = await safeGetLogs(vaultConfig, client, {
+        address: vaultConfig.address,
+        event: parseAbiItem('event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares)'),
+        fromBlock,
+        toBlock,
+      });
+    } catch (e) {
+      console.log(`[${vaultConfig.id}] Withdraw getLogs error (parsed event):`, e.message);
+    }
+    // Fallback: fetch by topic0 only (in case ABI parsing differs) and decode manually
+    if (withdrawLogs.length === 0) {
+      try {
+        const rawLogs = await safeGetLogs(vaultConfig, client, {
+          address: vaultConfig.address,
+          topics: [WITHDRAW_TOPIC0],
+          fromBlock,
+          toBlock,
+        });
+        for (const raw of rawLogs) {
+          if (raw.topics && raw.topics.length >= 4 && raw.data) {
+            const owner = '0x' + String(raw.topics[3]).slice(-40).toLowerCase();
+            const hex = typeof raw.data === 'string' ? raw.data.replace(/^0x/, '') : Buffer.from(raw.data || []).toString('hex');
+            const assets = hex.length >= 64 ? BigInt('0x' + hex.slice(0, 64)) : 0n;
+            const shares = hex.length >= 128 ? BigInt('0x' + hex.slice(64, 128)) : 0n;
+            withdrawLogs.push({
+              transactionHash: raw.transactionHash,
+              blockNumber: raw.blockNumber,
+              args: { owner, assets, shares },
+            });
+          }
+        }
+        if (withdrawLogs.length > 0) {
+          console.log(`[${vaultConfig.id}] Withdraw: got ${withdrawLogs.length} via topic0 fallback in blocks ${fromBlock}-${toBlock}`);
+        }
+      } catch (e2) {
+        console.log(`[${vaultConfig.id}] Withdraw topic0 fallback error:`, e2.message);
+      }
+    }
+    if (withdrawLogs.length > 0) {
+      console.log(`[${vaultConfig.id}] Found ${withdrawLogs.length} Withdraw event(s) in blocks ${fromBlock}-${toBlock}`);
+    }
+    for (const log of withdrawLogs) {
+      const { owner, assets, shares } = log.args;
+      const assetsStr = assets.toString();
+      const sharesStr = shares.toString();
+      const ownerLower = owner.toLowerCase();
+      const withdrawAssets = BigInt(assetsStr);
+      const withdrawShares = BigInt(sharesStr);
+
+      const baseFilter = {
+        chain: vaultConfig.chain,
+        vault_address: { $in: [vaultConfig.address, vaultAddrLower] },
+        user_address: { $in: [owner, ownerLower] },
+        status: { $in: ['settled', 'pending'] },
+      };
+
+      // One redeem() call can claim multiple settled requests → one Withdraw event with total assets/shares.
+      // Find ALL settled (then pending) withdrawals for this owner/vault, sort by settled_at then created_at,
+      // and mark as withdrawn the set whose combined shares (or assets) sum to the Withdraw event total.
+      const candidates = await colWithdrawals
+        .find(baseFilter)
+        .sort({ settled_at: 1, created_at: 1 })
+        .toArray();
+
+      let sumShares = 0n;
+      let sumAssets = 0n;
+      const toMark = [];
+      for (const w of candidates) {
+        const wShares = BigInt(w.shares || '0');
+        const wAssets = BigInt(w.assets || '0');
+        sumShares += wShares;
+        sumAssets += wAssets;
+        toMark.push(w);
+        // Stop once we've covered the Withdraw amount (allow >= for rounding)
+        if (sumShares >= withdrawShares || sumAssets >= withdrawAssets) break;
+      }
+
+      const alreadyRecorded = toMark.length > 0 && toMark.every((w) => w.withdrawn_tx === log.transactionHash);
+      if (toMark.length > 0 && !alreadyRecorded) {
+        const ids = toMark.map((w) => w._id);
+        await colWithdrawals.updateMany(
+          { _id: { $in: ids } },
+          {
+            $set: {
+              status: 'withdrawn',
+              withdrawn_at: new Date(),
+              withdrawn_tx: log.transactionHash,
+            },
+          }
+        );
+        console.log(`[${vaultConfig.id}] Withdraw tx=${log.transactionHash} -> marked ${toMark.length} withdrawal(s) as withdrawn (shares sum=${sumShares}, assets sum=${sumAssets})`);
+      } else if (toMark.length === 0) {
+        // No matching withdrawals (e.g. RedeemRequest was before indexer start) -> insert one record
+        const alreadyInserted = await colWithdrawals.findOne({
+          chain: vaultConfig.chain,
+          $or: [{ transaction_hash: log.transactionHash }, { withdrawn_tx: log.transactionHash }],
+        });
+        if (alreadyInserted) {
+          console.log(`[${vaultConfig.id}] Withdraw tx=${log.transactionHash} already recorded, skipping insert`);
+        } else {
+          const anyForOwner = await colWithdrawals.countDocuments({
+            chain: vaultConfig.chain,
+            vault_address: { $in: [vaultConfig.address, vaultAddrLower] },
+            user_address: { $in: [owner, ownerLower] },
+          });
+          console.log(`[${vaultConfig.id}] Withdraw tx=${log.transactionHash} owner=${owner} assets=${assetsStr} shares=${sharesStr} - no matching withdrawal (total for owner/vault: ${anyForOwner}). Inserting withdrawn record.`);
+          await colWithdrawals.insertOne({
+            user_address: owner,
+            vault_address: vaultConfig.address,
+            vault_id: vaultConfig.id,
+            vault_name: vaultConfig.name,
+            chain: vaultConfig.chain,
+            asset_symbol: vaultConfig.asset.symbol,
+            asset_decimals: vaultConfig.asset.decimals,
+            shares: sharesStr,
+            assets: assetsStr,
+            epoch_id: null,
+            status: 'withdrawn',
+            source: 'lagoon',
+            created_at: new Date(Number(log.blockNumber) * 1000),
+            settled_at: null,
+            withdrawn_at: new Date(),
+            withdrawn_tx: log.transactionHash,
+            block_number: log.blockNumber.toString(),
+            transaction_hash: log.transactionHash,
+          });
+        }
+      }
+    }
+
   } catch (error) {
     if (error.message && (error.message.includes('after last accepted block') || error.message.includes('requested from block'))) {
       const finalityError = new Error(`[${vaultConfig.id}] Block range ${fromBlock}-${toBlock} not yet finalized`);

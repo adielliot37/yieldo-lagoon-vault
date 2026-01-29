@@ -2,9 +2,28 @@
 
 import { ConnectButton } from '@rainbow-me/rainbowkit'
 import Link from 'next/link'
+import { useEffect, useState } from 'react'
 import { VAULTS_CONFIG } from '@/lib/vaults-config'
+import { VaultRatingBubble } from '@/components/VaultRatingBubble'
+import type { VaultRating } from '@/lib/vault-ratings'
+import { getIndexerApiUrl } from '@/lib/vault-ratings'
 
 export default function Home() {
+  const [ratings, setRatings] = useState<VaultRating[]>([])
+  const [ratingsLoading, setRatingsLoading] = useState(true)
+
+  useEffect(() => {
+    const apiUrl = getIndexerApiUrl()
+    fetch(`${apiUrl}/api/vault-ratings`)
+      .then((res) => (res.ok ? res.json() : []))
+      .then((data) => setRatings(Array.isArray(data) ? data : []))
+      .catch(() => setRatings([]))
+      .finally(() => setRatingsLoading(false))
+  }, [])
+
+  const getRatingForVault = (vaultId: string, chain: string) =>
+    ratings.find((r) => r.vault_id === vaultId && r.chain === chain) ?? null
+
   return (
     <main className="min-h-screen bg-white text-black">
       <nav className="border-b border-black px-6 py-4">
@@ -43,17 +62,30 @@ export default function Home() {
           </ul>
         </div>
 
-        <div className="border-t border-black pt-8 mt-8">
+        <div className="border-t border-black pt-8 mt-8 overflow-visible">
           <h3 className="text-xl font-bold mb-4">Integrated Vaults</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 overflow-visible">
             {VAULTS_CONFIG.map((vault) => {
               const explorerUrl = vault.chain === 'ethereum'
                 ? `https://etherscan.io/address/${vault.address}`
                 : `https://snowtrace.io/address/${vault.address}`
               const explorerName = vault.chain === 'ethereum' ? 'Etherscan' : 'Snowtrace'
+              const rating = getRatingForVault(vault.id, vault.chain)
               return (
-                <div key={vault.id} className="bg-gray-50 border border-black p-4">
-                  <p className="font-semibold text-lg mb-2">{vault.name}</p>
+                <div key={vault.id} className="relative overflow-visible bg-gray-50 border border-black p-4">
+                  <div className="absolute top-3 right-3 z-10">
+                    {ratingsLoading ? (
+                      <span className="text-xs text-gray-400">Loading score…</span>
+                    ) : (
+                      <VaultRatingBubble
+                        rating={rating}
+                        vaultId={vault.id}
+                        vaultName={vault.name}
+                        chain={vault.chain}
+                      />
+                    )}
+                  </div>
+                  <p className="font-semibold text-lg mb-2 pr-28">{vault.name}</p>
                   <p className="text-sm text-gray-600 mb-2">Lagoon Vault on {vault.chain.charAt(0).toUpperCase() + vault.chain.slice(1)}</p>
                   <p className="text-xs text-gray-500 break-all mb-2">
                     Address: {vault.address}

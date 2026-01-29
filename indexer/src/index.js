@@ -4,9 +4,12 @@ import { avalanche, mainnet } from 'viem/chains';
 import { MongoClient } from 'mongodb';
 import cron from 'node-cron';
 import { Vault } from '@lagoon-protocol/v0-viem';
+import { VaultUtils } from '@lagoon-protocol/v0-core';
 import dotenv from 'dotenv';
-import { VAULTS_CONFIG, getVaultById } from './vaults-config.js';
+import { VAULTS_CONFIG, getVaultById, getVaultByAddress } from './vaults-config.js';
 import { indexDepositRouterEventsForVault, indexVaultEventsForVault, setRateLimitHandler } from './vault-indexer.js';
+import { runVaultKPI } from '../../vault-kpi/src/run.js';
+import { getUnderlyingPrice, getTokenSupply } from '../../vault-kpi/src/explorer-api.js';
 
 dotenv.config();
 
@@ -51,6 +54,8 @@ let colWithdrawals;
 let colSnapshots;
 let colMeta;
 let colPendingYieldoWithdrawals;
+let colVaultRatings;
+let colVaultRatingHistory;
 
 const clients = {};
 const rpcIndices = {};
@@ -204,6 +209,8 @@ async function initDatabase() {
   colSnapshots = db.collection('snapshots');
   colMeta = db.collection('meta');
   colPendingYieldoWithdrawals = db.collection('pending_yieldo_withdrawals');
+  colVaultRatings = db.collection('vault_ratings');
+  colVaultRatingHistory = db.collection('vault_rating_history');
 
   try {
     await colDeposits.dropIndex('transaction_hash_1').catch(() => {});
@@ -226,6 +233,10 @@ async function initDatabase() {
     colWithdrawals.createIndex({ source: 1, chain: 1, vault_id: 1 }),
     colSnapshots.createIndex({ date: 1, vault_id: 1, chain: 1 }, { unique: true }),
     colSnapshots.createIndex({ chain: 1, vault_id: 1, date: -1 }),
+    colVaultRatings.createIndex({ vault_id: 1, chain: 1 }, { unique: true }),
+    colVaultRatings.createIndex({ updated_at: -1 }),
+    colVaultRatingHistory.createIndex({ vault_id: 1, chain: 1, snapshot_at: -1 }),
+    colVaultRatingHistory.createIndex({ snapshot_at: -1 }),
     colPendingYieldoWithdrawals.createIndex({ user_address: 1, created_at: -1 }),
     colPendingYieldoWithdrawals.createIndex({ transaction_hash: 1, chain: 1 }, { unique: true }),
     colPendingYieldoWithdrawals.createIndex({ created_at: 1 }, { expireAfterSeconds: 3600 }),
@@ -852,6 +863,23 @@ async function createDailySnapshot(optionalDateStr) {
         console.log(`[${vaultConfig.id}] AUM (calculated from scratch for ${dateKey}): deposits=${(totalAllDeposits / BigInt(10 ** vaultConfig.asset.decimals)).toString()}, yieldo_withdrawals=${(totalAllYieldoWithdrawals / BigInt(10 ** vaultConfig.asset.decimals)).toString()}, result=${(yieldoAUM / BigInt(10 ** vaultConfig.asset.decimals)).toString()}, deposit_count=${allDepositsUpToDate.length}, withdrawal_count=${allYieldoWithdrawalsUpToDate.length}`);
       }
 
+      const totalSupplyStr = vault.totalSupply?.toString() || '0';
+      
+      // Calculate share price using Lagoon SDK's convertToAssets
+      // This is the proper way to get share price: assets per 1 share (10^18)
+      let sharePriceStr = '0';
+      try {
+        if (vault.totalSupply && vault.totalSupply > 0n) {
+          const sharePrice = vault.convertToAssets(VaultUtils.ONE_SHARE);
+          sharePriceStr = sharePrice.toString();
+          console.log(`[${vaultConfig.id}] Share price: ${Number(sharePrice) / 1e6} USDC per share`);
+        } else {
+          console.warn(`[${vaultConfig.id}] totalSupply is 0, cannot calculate share price`);
+        }
+      } catch (e) {
+        console.warn(`[${vaultConfig.id}] Failed to calculate share price:`, e.message);
+      }
+      
       await colSnapshots.updateOne(
         { date: dateKey, vault_id: vaultConfig.id, chain: vaultConfig.chain },
         {
@@ -864,7 +892,8 @@ async function createDailySnapshot(optionalDateStr) {
             asset_symbol: vaultConfig.asset.symbol,
             asset_decimals: vaultConfig.asset.decimals,
             total_assets: yieldoAUM.toString(),
-            total_supply: vault.totalSupply?.toString() || '0',
+            total_supply: totalSupplyStr,
+            share_price: sharePriceStr, // Assets per 1 share (10^18 shares)
             total_deposits: totalDeposits,
             total_withdrawals: totalWithdrawals.toString(),
             deposit_epoch_id: vault.depositEpochId || 0,
@@ -1078,8 +1107,22 @@ async function startIndexing() {
     }
   }, 30000);
 
-  cron.schedule('0 0 * * *', createDailySnapshot);
-  console.log('Daily snapshot scheduler started');
+  cron.schedule('0 0 * * *', async () => {
+    await createDailySnapshot();
+    try {
+      await runVaultKPI({
+        db,
+        getClientForVault,
+        VAULTS_CONFIG,
+        getVaultById,
+        options: { getUnderlyingPrice, getTokenSupply },
+      });
+      console.log('Vault KPI / rating job completed');
+    } catch (err) {
+      console.error('Vault KPI job error:', err);
+    }
+  });
+  console.log('Daily snapshot + vault KPI scheduler started (00:00 UTC)');
 }
 
 app.get('/api/deposits', async (req, res) => {
@@ -1245,6 +1288,8 @@ app.get('/api/withdrawals', async (req, res) => {
         source: w.source || 'lagoon',
         timestamp: w.created_at?.toISOString?.() || new Date().toISOString(),
         settledAt: w.settled_at?.toISOString?.() || null,
+        withdrawnAt: w.withdrawn_at?.toISOString?.() || null,
+        withdrawnTx: w.withdrawn_tx ?? null,
         blockNumber: w.block_number ?? null,
         txHash: w.transaction_hash ?? null,
       }))
@@ -1479,6 +1524,63 @@ app.post('/api/withdrawals/mark-yieldo', async (req, res) => {
   }
 });
 
+// Re-index the block containing a tx to pick up missed Withdraw (or other) events
+app.post('/api/withdrawals/backfill-tx', async (req, res) => {
+  try {
+    const { txHash, chain } = req.body;
+    if (!txHash) {
+      return res.status(400).json({ error: 'txHash is required' });
+    }
+    const chainsToTry = chain ? [chain] : ['avalanche', 'ethereum'];
+    for (const c of chainsToTry) {
+      const client = clients[c];
+      if (!client) continue;
+      const receipt = await client.getTransactionReceipt({ hash: txHash });
+      if (!receipt) continue;
+      const block = receipt.blockNumber;
+      let vaultConfig = null;
+      for (const log of receipt.logs || []) {
+        vaultConfig = getVaultByAddress(log.address, c);
+        if (vaultConfig) break;
+      }
+      if (!vaultConfig) {
+        return res.status(400).json({
+          error: `No known vault found in tx logs for chain ${c}`,
+          txHash,
+          blockNumber: block.toString(),
+        });
+      }
+      console.log(`[${vaultConfig.id}] Backfilling block ${block} for tx ${txHash} (Withdraw/events)`);
+      await indexVaultEventsForVault(
+        vaultConfig,
+        client,
+        colDeposits,
+        colWithdrawals,
+        colPendingYieldoWithdrawals,
+        colIntents,
+        colMeta,
+        block,
+        block
+      );
+      return res.json({
+        success: true,
+        message: `Re-indexed block ${block} for vault ${vaultConfig.id}. Withdrawal should now be marked withdrawn if applicable.`,
+        txHash,
+        blockNumber: block.toString(),
+        vault_id: vaultConfig.id,
+        chain: c,
+      });
+    }
+    return res.status(404).json({
+      error: 'Transaction not found on any configured chain',
+      txHash,
+    });
+  } catch (error) {
+    console.error('Error backfilling withdrawal tx:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/aum', async (req, res) => {
   try {
     const { user, vault_id, chain, combined } = req.query;
@@ -1504,7 +1606,7 @@ app.get('/api/aum', async (req, res) => {
     const withdrawalFilter = {
       user_address: user,
       source: 'yieldo',
-      status: { $in: ['pending', 'settled'] }
+      status: { $in: ['pending', 'settled', 'withdrawn'] }
     };
     if (vault_id) {
       withdrawalFilter.vault_id = vault_id;
@@ -1528,7 +1630,7 @@ app.get('/api/aum', async (req, res) => {
       ? {
           user_address: user,
           source: 'yieldo',
-          status: { $in: ['pending', 'settled'] }
+          status: { $in: ['pending', 'settled', 'withdrawn'] }
         }
       : withdrawalFilter;
     
@@ -1641,6 +1743,79 @@ app.get('/api/aum', async (req, res) => {
     });
   } catch (error) {
     console.error('Error calculating AUM:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/vault-ratings', async (req, res) => {
+  try {
+    const { vault_id, chain } = req.query;
+    const filter = {};
+    if (vault_id) filter.vault_id = vault_id;
+    if (chain) filter.chain = chain;
+    const docs = await colVaultRatings.find(filter).sort({ updated_at: -1 }).toArray();
+    res.json(
+      docs.map((d) => ({
+        vault_id: d.vault_id,
+        vault_name: d.vault_name,
+        vault_address: d.vault_address,
+        chain: d.chain,
+        asset_symbol: d.asset_symbol,
+        metrics: d.metrics,
+        derived: d.derived,
+        score: d.score,
+        score_breakdown: d.score_breakdown,
+        updated_at: d.updated_at?.toISOString?.() ?? null,
+        last_curated_at: d.last_curated_at?.toISOString?.() ?? null,
+      }))
+    );
+  } catch (error) {
+    console.error('Error fetching vault ratings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/vault-ratings/run', async (req, res) => {
+  try {
+    const results = await runVaultKPI({
+      db,
+      getClientForVault,
+      VAULTS_CONFIG,
+      getVaultById,
+      options: { getUnderlyingPrice, getTokenSupply },
+    });
+    res.json({ success: true, message: 'Vault KPI job completed', results });
+  } catch (error) {
+    console.error('Error running vault KPI:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/vault-ratings/:vault_id/history', async (req, res) => {
+  try {
+    const { vault_id } = req.params;
+    const { chain, limit = '30' } = req.query;
+    const filter = { vault_id };
+    if (chain) filter.chain = chain;
+    const n = Math.min(100, parseInt(limit, 10) || 30);
+    const docs = await colVaultRatingHistory
+      .find(filter)
+      .sort({ snapshot_at: -1 })
+      .limit(n)
+      .toArray();
+    res.json(
+      docs.map((d) => ({
+        vault_id: d.vault_id,
+        chain: d.chain,
+        snapshot_at: d.snapshot_at?.toISOString?.() ?? null,
+        score: d.score,
+        score_breakdown: d.score_breakdown,
+        metrics: d.metrics,
+        derived: d.derived,
+      }))
+    );
+  } catch (error) {
+    console.error('Error fetching vault rating history:', error);
     res.status(500).json({ error: error.message });
   }
 });

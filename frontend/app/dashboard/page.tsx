@@ -1,11 +1,14 @@
 'use client'
 
-import { useAccount } from 'wagmi'
+import { useAccount, useChainId, useReadContract, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi'
 import { ConnectButton } from '@rainbow-me/rainbowkit'
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
+import { Address } from 'viem'
+import { formatUnits } from 'viem'
 import { VaultSelector } from '@/components/VaultSelector'
 import { VAULTS_CONFIG, getVaultById } from '@/lib/vaults-config'
+import { VAULT_REDEEM_ABI } from '@/lib/vault-abi'
 
 interface DepositIntent {
   id: string
@@ -38,7 +41,7 @@ interface Withdrawal {
   shares: string
   assets: string | null
   epochId: number | null
-  status: 'pending' | 'settled'
+  status: 'pending' | 'settled' | 'withdrawn'
   source: string
   timestamp: string
   settledAt: string | null
@@ -139,11 +142,59 @@ interface VaultDataCache {
 
 export default function Dashboard() {
   const { address, isConnected } = useAccount()
+  const chainId = useChainId()
+  const { switchChain } = useSwitchChain()
   const [dataCache, setDataCache] = useState<Map<string, VaultDataCache>>(new Map())
   const [snapshots, setSnapshots] = useState<Snapshot[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedVaultId, setSelectedVaultId] = useState<string | null>('combined')
   const [initialLoadComplete, setInitialLoadComplete] = useState(false)
+  const [claimWithdrawLoading, setClaimWithdrawLoading] = useState(false)
+
+  const selectedVault = selectedVaultId && selectedVaultId !== 'combined' ? getVaultById(selectedVaultId) : null
+  const chainMatchesVault = selectedVault ? chainId === selectedVault.chainId : false
+
+  const { data: claimableShares, refetch: refetchClaimable } = useReadContract({
+    address: selectedVault?.address as Address | undefined,
+    abi: VAULT_REDEEM_ABI,
+    functionName: 'maxRedeem',
+    args: address ? [address] : undefined,
+    query: { enabled: !!address && !!selectedVault && chainMatchesVault },
+  })
+  const { data: claimableAssets } = useReadContract({
+    address: selectedVault?.address as Address | undefined,
+    abi: VAULT_REDEEM_ABI,
+    functionName: 'maxWithdraw',
+    args: address ? [address] : undefined,
+    query: { enabled: !!address && !!selectedVault && chainMatchesVault },
+  })
+
+  const { writeContract: writeRedeem, data: redeemHash, isPending: isRedeemPending, reset: resetRedeem, error: writeRedeemError } = useWriteContract()
+  const { isSuccess: isRedeemSuccess } = useWaitForTransactionReceipt({ hash: redeemHash })
+
+  useEffect(() => {
+    if (writeRedeemError) setClaimWithdrawLoading(false)
+  }, [writeRedeemError])
+
+  useEffect(() => {
+    if (isRedeemSuccess && redeemHash) {
+      setClaimWithdrawLoading(false)
+      resetRedeem()
+      refetchClaimable()
+      loadAllVaultData()
+    }
+  }, [isRedeemSuccess, redeemHash])
+
+  const handleClaimWithdraw = () => {
+    if (!address || !selectedVault || claimableShares === undefined || claimableShares === 0n) return
+    setClaimWithdrawLoading(true)
+    writeRedeem({
+      address: selectedVault.address as Address,
+      abi: VAULT_REDEEM_ABI,
+      functionName: 'redeem',
+      args: [claimableShares, address, address],
+    })
+  }
 
   const ITEMS_PER_PAGE = 5
   const [depositsPage, setDepositsPage] = useState(1)
@@ -341,6 +392,34 @@ export default function Dashboard() {
           </div>
         )}
 
+        {selectedVault && (
+          <div className="border-2 border-black p-6 mb-8 bg-gray-50">
+            <h2 className="text-xl font-bold mb-2">Assets available to withdraw</h2>
+            {!chainMatchesVault ? (
+              <p className="text-gray-600 mb-3">
+                Select vault &quot;{selectedVault.name}&quot; above and switch your wallet to {selectedVault.chain} to see claimable assets and withdraw.
+              </p>
+            ) : claimableShares !== undefined && claimableAssets !== undefined && claimableShares > 0n ? (
+              <>
+                <p className="text-gray-700 mb-2">
+                  <span className="font-semibold">{formatUnits(claimableAssets, selectedVault.asset.decimals)} {selectedVault.asset.symbol}</span>
+                  {' '}({selectedVault.name})
+                </p>
+                <p className="text-sm text-green-700 mb-3">Redemption complete. You can now withdraw your underlying assets.</p>
+                <button
+                  onClick={handleClaimWithdraw}
+                  disabled={claimWithdrawLoading || isRedeemPending || claimableShares === 0n}
+                  className="bg-green-600 text-white py-2 px-4 font-semibold hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                >
+                  {claimWithdrawLoading || isRedeemPending ? 'Withdrawing...' : 'Withdraw'}
+                </button>
+              </>
+            ) : (
+              <p className="text-gray-600">No assets ready to withdraw for this vault. Pending redemptions will appear here after settlement.</p>
+            )}
+          </div>
+        )}
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-12">
           <div className="border-2 border-black p-6">
             <h2 className="text-2xl font-bold mb-4">Your Deposits</h2>
@@ -481,10 +560,11 @@ export default function Dashboard() {
                           </div>
                         </div>
                         <span className={`text-sm px-2 py-1 rounded ${
+                          withdrawal.status === 'withdrawn' ? 'bg-gray-600 text-white' :
                           withdrawal.status === 'settled' ? 'bg-green-600 text-white' :
                           'bg-yellow-100 text-yellow-800'
                         }`}>
-                          {withdrawal.status === 'settled' ? '✅ Settled' : '⏳ Pending'}
+                          {withdrawal.status === 'withdrawn' ? '✅ Withdrawn' : withdrawal.status === 'settled' ? 'Ready to withdraw' : '⏳ Pending'}
                         </span>
                       </div>
                       <div className="text-sm text-gray-600 space-y-1 mt-2">
@@ -512,6 +592,9 @@ export default function Dashboard() {
                       )}
                         {withdrawal.status === 'pending' && (
                           <p className="text-xs text-yellow-600">⏳ Waiting for settlement...</p>
+                        )}
+                        {withdrawal.status === 'settled' && (
+                          <p className="text-xs text-green-600">Redemption complete. Use &quot;Assets available to withdraw&quot; above to claim.</p>
                         )}
                       </div>
                     </div>

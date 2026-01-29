@@ -9,6 +9,7 @@ import { getVaultState } from '@/lib/lagoon'
 import { signDepositIntent, getIntentHash, type DepositIntent } from '@/lib/eip712'
 import { VAULTS_CONFIG, getVaultById, VaultConfig } from '@/lib/vaults-config'
 import { VaultSelector } from '@/components/VaultSelector'
+import { VAULT_REDEEM_ABI } from '@/lib/vault-abi'
 import ERC20_ABI from '@/lib/erc20-abi.json'
 import DEPOSIT_ROUTER_ABI from '@/lib/deposit-router-abi.json'
 
@@ -45,8 +46,25 @@ export default function KOLPage() {
   const [withdrawLoading, setWithdrawLoading] = useState(false)
   const [withdrawHash, setWithdrawHash] = useState<`0x${string}` | null>(null)
   const [withdrawSuccess, setWithdrawSuccess] = useState(false)
-  const [currentWithdrawTxType, setCurrentWithdrawTxType] = useState<'withdraw' | null>(null)
+  const [currentWithdrawTxType, setCurrentWithdrawTxType] = useState<'withdraw' | 'claimWithdraw' | null>(null)
+  const [lastWithdrawTxType, setLastWithdrawTxType] = useState<'withdraw' | 'claimWithdraw' | null>(null)
   const publicClient = usePublicClient()
+
+  const { data: claimableRedeemShares } = useReadContract({
+    address: VAULT_ADDRESS as Address,
+    abi: VAULT_REDEEM_ABI,
+    functionName: 'maxRedeem',
+    args: address ? [address] : undefined,
+    query: { enabled: !!address && !!VAULT_ADDRESS && chainId === selectedVault.chainId },
+  })
+  const { data: claimableWithdrawAssets } = useReadContract({
+    address: VAULT_ADDRESS as Address,
+    abi: VAULT_REDEEM_ABI,
+    functionName: 'maxWithdraw',
+    args: address ? [address] : undefined,
+    query: { enabled: !!address && !!VAULT_ADDRESS && chainId === selectedVault.chainId },
+  })
+  const hasClaimable = (claimableRedeemShares ?? 0n) > 0n
 
   const { writeContract, data: hash, isPending, reset: resetWriteContract, error: writeError } = useWriteContract()
   const { isLoading: isConfirming, isSuccess, isError: isReceiptError, error: receiptError } = useWaitForTransactionReceipt({
@@ -550,7 +568,8 @@ export default function KOLPage() {
   }, [isSuccess, currentTxType, hash, pendingIntentHash])
 
   useEffect(() => {
-    if (isSuccess && currentWithdrawTxType === 'withdraw' && hash) {
+    if (isSuccess && (currentWithdrawTxType === 'withdraw' || currentWithdrawTxType === 'claimWithdraw') && hash) {
+      setLastWithdrawTxType(currentWithdrawTxType)
       setWithdrawLoading(false)
       setCurrentWithdrawTxType(null)
       setWithdrawSuccess(true)
@@ -595,6 +614,7 @@ export default function KOLPage() {
       setTimeout(() => {
         setWithdrawSuccess(false)
         setWithdrawHash(null)
+        setLastWithdrawTxType(null)
       }, 10000)
     }
   }, [isSuccess, currentWithdrawTxType, hash])
@@ -633,59 +653,20 @@ export default function KOLPage() {
 
       const userWithdrawals = await fetch(`${apiUrl}/api/withdrawals?user=${address}`).then(r => r.json()).catch(() => [])
       const hasSettledWithdrawals = userWithdrawals.some((w: any) => w.status === 'settled')
-      
-      if (hasSettledWithdrawals) {
-        writeContract({
-          address: VAULT_ADDRESS as Address,
-          abi: [
-            {
-              inputs: [
-                { name: 'sharesToRedeem', type: 'uint256' },
-              ],
-              name: 'claimSharesAndRequestRedeem',
-              outputs: [{ name: 'requestId', type: 'uint40' }],
-              stateMutability: 'nonpayable',
-              type: 'function',
-            },
-          ],
-          functionName: 'claimSharesAndRequestRedeem',
-          args: [sharesNeeded],
-        })
-      } else {
-        writeContract({
-          address: VAULT_ADDRESS as Address,
-          abi: [
-            {
-              inputs: [
-                { name: 'shares', type: 'uint256' },
-                { name: 'controller', type: 'address' },
-                { name: 'owner', type: 'address' },
-              ],
-              name: 'requestRedeem',
-              outputs: [{ name: 'requestId', type: 'uint256' }],
-              stateMutability: 'nonpayable',
-              type: 'function',
-            },
-          ],
-          functionName: 'requestRedeem',
-          args: [sharesNeeded, address, address],
-        })
-      }
-      
-    } catch (error: any) {
-      console.error('Withdraw failed:', error)
-      setWithdrawLoading(false)
-      setCurrentWithdrawTxType(null)
-      
-      if (error.message && (error.message.includes('claimSharesAndRequestRedeem') || error.message.includes('revert'))) {
-        try {
-          const vault = vaultState || await getVaultState(VAULT_ADDRESS as Address, selectedVault.chain)
-          const withdrawAmountUSDC = parseUnits(withdrawAmount, selectedVault.asset.decimals)
-          const sharesNeeded = (withdrawAmountUSDC * vault.totalSupply) / vault.totalAssets
-          
-          writeContract({
-            address: VAULT_ADDRESS as Address,
-            abi: [
+
+      writeContract({
+        address: VAULT_ADDRESS as Address,
+        abi: hasSettledWithdrawals
+          ? [
+              {
+                inputs: [{ name: 'sharesToRedeem', type: 'uint256' }],
+                name: 'claimSharesAndRequestRedeem',
+                outputs: [{ name: 'requestId', type: 'uint40' }],
+                stateMutability: 'nonpayable',
+                type: 'function',
+              },
+            ]
+          : [
               {
                 inputs: [
                   { name: 'shares', type: 'uint256' },
@@ -698,6 +679,21 @@ export default function KOLPage() {
                 type: 'function',
               },
             ],
+        functionName: hasSettledWithdrawals ? 'claimSharesAndRequestRedeem' : 'requestRedeem',
+        args: hasSettledWithdrawals ? [sharesNeeded] : [sharesNeeded, address, address],
+      })
+    } catch (error: any) {
+      console.error('Withdraw failed:', error)
+      setWithdrawLoading(false)
+      setCurrentWithdrawTxType(null)
+      if (error.message && (error.message.includes('claimSharesAndRequestRedeem') || error.message.includes('revert'))) {
+        try {
+          const vault = vaultState || await getVaultState(VAULT_ADDRESS as Address, selectedVault.chain)
+          const withdrawAmountUSDC = parseUnits(withdrawAmount, selectedVault.asset.decimals)
+          const sharesNeeded = (withdrawAmountUSDC * vault.totalSupply) / vault.totalAssets
+          writeContract({
+            address: VAULT_ADDRESS as Address,
+            abi: [{ inputs: [{ name: 'shares', type: 'uint256' }, { name: 'controller', type: 'address' }, { name: 'owner', type: 'address' }], name: 'requestRedeem', outputs: [{ name: 'requestId', type: 'uint256' }], stateMutability: 'nonpayable', type: 'function' }],
             functionName: 'requestRedeem',
             args: [sharesNeeded, address, address],
           })
@@ -712,6 +708,21 @@ export default function KOLPage() {
         setCurrentWithdrawTxType(null)
       }
     }
+  }
+
+  const handleClaimWithdraw = () => {
+    if (!address || !VAULT_ADDRESS || claimableRedeemShares === undefined || claimableRedeemShares === 0n) return
+    setWithdrawLoading(true)
+    setCurrentWithdrawTxType('claimWithdraw')
+    setWithdrawSuccess(false)
+    setWithdrawHash(null)
+    resetWriteContract()
+    writeContract({
+      address: VAULT_ADDRESS as Address,
+      abi: VAULT_REDEEM_ABI,
+      functionName: 'redeem',
+      args: [claimableRedeemShares, address, address],
+    })
   }
 
   if (!isConnected) {
@@ -931,11 +942,28 @@ export default function KOLPage() {
 
           <div className="border-2 border-black p-6 sm:p-8">
             <h2 className="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">Withdraw {selectedVault.asset.symbol}</h2>
+
+            {hasClaimable && (claimableWithdrawAssets ?? 0n) > 0n && (
+              <div className="mb-4 p-4 bg-green-50 border-2 border-green-400 rounded">
+                <p className="font-semibold text-green-900 mb-1">Assets available to withdraw</p>
+                <p className="text-green-800 text-sm">
+                  {formatUnits(claimableWithdrawAssets ?? 0n, selectedVault.asset.decimals)} {selectedVault.asset.symbol}
+                </p>
+                <p className="text-green-700 text-xs mt-1">Redemption complete. You can now withdraw your underlying assets.</p>
+                <button
+                  onClick={handleClaimWithdraw}
+                  disabled={withdrawLoading || isPending || !claimableRedeemShares || claimableRedeemShares === 0n}
+                  className="mt-3 w-full bg-green-600 text-white py-2.5 px-4 font-semibold hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                >
+                  {(withdrawLoading || isPending) && currentWithdrawTxType === 'claimWithdraw' ? 'Withdrawing...' : 'Withdraw'}
+                </button>
+              </div>
+            )}
             
             {vaultShares > BigInt(0) && (
               <div className="mb-4 p-3 bg-blue-50 border border-blue-300 rounded text-sm">
                 <p className="text-blue-800">
-                  Available to Withdraw: <span className="font-semibold">
+                  Request new withdrawal (from shares): <span className="font-semibold">
                     {vaultState ? formatUnits(
                       vaultState.totalSupply > 0n 
                         ? (vaultShares * vaultState.totalAssets) / vaultState.totalSupply
@@ -985,18 +1013,27 @@ export default function KOLPage() {
                 {withdrawLoading || (isPending && currentWithdrawTxType === 'withdraw') ? 'Withdrawing...' : 'Withdraw from Vault'}
               </button>
 
-              {isConfirming && currentWithdrawTxType === 'withdraw' && (
+              {isConfirming && (currentWithdrawTxType === 'withdraw' || currentWithdrawTxType === 'claimWithdraw') && (
                 <div className="p-3 bg-blue-50 border border-blue-200 rounded">
-                  <p className="text-sm text-blue-700">Confirming withdrawal transaction...</p>
-                  <p className="text-xs text-blue-600 mt-1">Withdrawal will be pending until settlement.</p>
+                  <p className="text-sm text-blue-700">Confirming {currentWithdrawTxType === 'claimWithdraw' ? 'withdrawal' : 'withdrawal request'}...</p>
+                  {currentWithdrawTxType === 'withdraw' && <p className="text-xs text-blue-600 mt-1">Withdrawal will be pending until settlement.</p>}
                 </div>
               )}
 
               {withdrawSuccess && (
                 <div className="p-4 bg-green-50 border-2 border-green-500 rounded">
-                  <p className="font-semibold text-green-800">✅ Withdrawal Requested!</p>
-                  <p className="text-sm text-green-700 mt-1">Your withdrawal request has been submitted.</p>
-                  <p className="text-xs text-green-600 mt-1">Status: <span className="font-semibold">Pending</span> (waiting for settlement)</p>
+                  {lastWithdrawTxType === 'claimWithdraw' ? (
+                    <>
+                      <p className="font-semibold text-green-800">✅ Withdrawal complete!</p>
+                      <p className="text-sm text-green-700 mt-1">Your assets have been transferred to your wallet.</p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="font-semibold text-green-800">✅ Withdrawal Requested!</p>
+                      <p className="text-sm text-green-700 mt-1">Your withdrawal request has been submitted.</p>
+                      <p className="text-xs text-green-600 mt-1">Status: <span className="font-semibold">Pending</span> (waiting for settlement)</p>
+                    </>
+                  )}
                   {withdrawHash && (
                     <>
                       <p className="text-xs text-green-600 mt-2 break-all">Tx Hash: {withdrawHash}</p>
