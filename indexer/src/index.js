@@ -8,8 +8,27 @@ import { VaultUtils } from '@lagoon-protocol/v0-core';
 import dotenv from 'dotenv';
 import { VAULTS_CONFIG, getVaultById, getVaultByAddress } from './vaults-config.js';
 import { indexDepositRouterEventsForVault, indexVaultEventsForVault, setRateLimitHandler } from './vault-indexer.js';
-import { runVaultKPI } from '../../vault-kpi/src/run.js';
-import { getUnderlyingPrice, getTokenSupply } from '../../vault-kpi/src/explorer-api.js';
+
+let runVaultKPI = null;
+let getUnderlyingPrice = null;
+let getTokenSupply = null;
+
+async function loadVaultKPI() {
+  if (runVaultKPI) return;
+  try {
+    const runModule = await import('../../vault-kpi/src/run.js');
+    const explorerModule = await import('../../vault-kpi/src/explorer-api.js');
+    runVaultKPI = runModule.runVaultKPI;
+    getUnderlyingPrice = explorerModule.getUnderlyingPrice;
+    getTokenSupply = explorerModule.getTokenSupply;
+  } catch (e) {
+    if (e.code === 'ERR_MODULE_NOT_FOUND' || e.message?.includes('Cannot find module')) {
+      console.warn('vault-kpi not found (deploy vault-kpi separately or run from monorepo root). KPI/rating job disabled.');
+    } else {
+      console.warn('vault-kpi load failed:', e.message);
+    }
+  }
+}
 
 dotenv.config();
 
@@ -1109,6 +1128,8 @@ async function startIndexing() {
 
   cron.schedule('0 0 * * *', async () => {
     await createDailySnapshot();
+    await loadVaultKPI();
+    if (!runVaultKPI) return;
     try {
       await runVaultKPI({
         db,
@@ -1777,6 +1798,10 @@ app.get('/api/vault-ratings', async (req, res) => {
 
 app.post('/api/vault-ratings/run', async (req, res) => {
   try {
+    await loadVaultKPI();
+    if (!runVaultKPI) {
+      return res.status(503).json({ error: 'vault-kpi not available. Deploy vault-kpi or run indexer from monorepo root.' });
+    }
     const results = await runVaultKPI({
       db,
       getClientForVault,
